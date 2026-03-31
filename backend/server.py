@@ -4,7 +4,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-from fastapi import FastAPI, APIRouter, Request, HTTPException, Depends, Query
+from fastapi import FastAPI, APIRouter, Request, HTTPException, Depends, Query, WebSocket, WebSocketDisconnect
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from slowapi import Limiter
@@ -473,6 +473,54 @@ class CategoryUpdate(BaseModel):
     icon: Optional[str] = None
     sort_order: Optional[int] = None
     is_active: Optional[bool] = None
+
+# ─── WebSocket Connection Manager ────────────────────────────────
+
+class InventoryWSManager:
+    """Manages WebSocket connections for real-time inventory updates per tenant"""
+    def __init__(self):
+        self.connections: dict = {}  # tenant_id -> list of websockets
+        self.event_log: dict = {}   # tenant_id -> deque of recent events
+
+    async def connect(self, ws: WebSocket, tenant_id: str):
+        await ws.accept()
+        if tenant_id not in self.connections:
+            self.connections[tenant_id] = []
+        self.connections[tenant_id].append(ws)
+        if tenant_id not in self.event_log:
+            from collections import deque
+            self.event_log[tenant_id] = deque(maxlen=200)
+
+    def disconnect(self, ws: WebSocket, tenant_id: str):
+        if tenant_id in self.connections:
+            self.connections[tenant_id] = [c for c in self.connections[tenant_id] if c != ws]
+
+    async def broadcast(self, tenant_id: str, event: dict):
+        """Broadcast event to all connected clients for a tenant"""
+        event["timestamp"] = datetime.now(timezone.utc).isoformat()
+        event["id"] = str(uuid.uuid4())[:8]
+        if tenant_id in self.event_log:
+            self.event_log[tenant_id].append(event)
+        if tenant_id not in self.connections:
+            return
+        dead = []
+        for ws in self.connections[tenant_id]:
+            try:
+                await ws.send_json(event)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.connections[tenant_id] = [c for c in self.connections[tenant_id] if c != ws]
+
+    def get_recent_events(self, tenant_id: str, limit: int = 50):
+        if tenant_id not in self.event_log:
+            return []
+        return list(self.event_log[tenant_id])[-limit:]
+
+    def get_stats(self):
+        return {tid: len(conns) for tid, conns in self.connections.items() if conns}
+
+ws_manager = InventoryWSManager()
 
 # ─── Utility Functions ────────────────────────────────────────────
 
@@ -1286,6 +1334,13 @@ async def adjust_stock(adj: StockAdjust, request: Request):
         {"$set": {"stock": new_stock, "updated_at": datetime.now(timezone.utc).isoformat()}}
     )
     await log_audit(user["tenant_id"], user["id"], "stock_adjusted", f"Product: {adj.product_id}, adjustment: {adj.adjustment}, reason: {adj.reason}", request.client.host if request.client else "")
+    # Broadcast real-time event
+    import asyncio
+    asyncio.ensure_future(ws_manager.broadcast(user["tenant_id"], {
+        "type": "stock_adjusted", "product_id": adj.product_id, "product_name": product.get("name", ""),
+        "branch_id": product.get("branch_id", ""), "old_stock": product["stock"], "new_stock": new_stock,
+        "adjustment": adj.adjustment, "user": user.get("name", "")
+    }))
     # Check reorder rules
     await check_reorder_for_product(user["tenant_id"], adj.product_id, user)
     return {"message": "Stock adjusted", "new_stock": new_stock}
@@ -1365,6 +1420,14 @@ async def create_invoice(inv: InvoiceCreate, request: Request):
             )
 
     await log_audit(user["tenant_id"], user["id"], "invoice_created", f"Invoice: {invoice_number}, Total: {grand_total}, Device: {inv.device_source}", request.client.host if request.client else "")
+    # Broadcast real-time event
+    import asyncio
+    asyncio.ensure_future(ws_manager.broadcast(user["tenant_id"], {
+        "type": "invoice_created", "invoice_number": invoice_number,
+        "grand_total": grand_total, "items_count": len(inv.items),
+        "branch_id": inv.branch_id, "user": user.get("name", ""),
+        "customer": inv.customer_name or "Walk-in",
+    }))
     # Invalidate caches (stock changed, new invoice)
     product_cache.invalidate(user["tenant_id"])
     dashboard_cache.invalidate(user["tenant_id"])
@@ -6215,6 +6278,13 @@ async def handle_transfer_request(request_id: str, request: Request):
         await log_audit(user["tenant_id"], user["id"], "transfer_approved",
                         f"Approved transfer of {tr['quantity']}x {tr.get('product_name','')}",
                         request.client.host if request.client else "")
+        # Broadcast real-time event
+        import asyncio
+        asyncio.ensure_future(ws_manager.broadcast(user["tenant_id"], {
+            "type": "transfer_approved", "product_name": tr.get("product_name", ""),
+            "quantity": tr["quantity"], "source_branch_id": tr["source_branch_id"],
+            "target_branch_id": tr["target_branch_id"], "user": user.get("name", ""),
+        }))
         return {"message": "Transfer approved and stock updated"}
 
     elif action == "reject":
@@ -6382,6 +6452,170 @@ async def category_breadcrumb(category_id: str, request: Request):
         breadcrumb = ancestors
 
     return {"breadcrumb": breadcrumb, "current": {"id": cat["id"], "name": cat["name"]}}
+
+# ═══════════════════════════════════════════════════════════════════
+#  REAL-TIME WEBSOCKET INVENTORY SYNC
+# ═══════════════════════════════════════════════════════════════════
+
+@app.websocket("/ws/inventory/{tenant_id}")
+async def ws_inventory(websocket: WebSocket, tenant_id: str):
+    """WebSocket endpoint for real-time inventory updates"""
+    await ws_manager.connect(websocket, tenant_id)
+    try:
+        # Send recent events on connect
+        recent = ws_manager.get_recent_events(tenant_id, 50)
+        await websocket.send_json({"type": "init", "events": recent, "connected": True})
+        # Keep connection alive
+        while True:
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket, tenant_id)
+    except Exception:
+        ws_manager.disconnect(websocket, tenant_id)
+
+@api_router.get("/realtime/dashboard")
+async def realtime_dashboard(request: Request):
+    """Get real-time dashboard data: live stock snapshot, recent events, branch health"""
+    user = await get_current_user(request)
+    tid = user["tenant_id"]
+    if user["role"] not in ("OWNER", "MANAGER"):
+        raise HTTPException(403, "Requires OWNER or MANAGER")
+
+    # Recent events from WebSocket event log
+    recent_events = ws_manager.get_recent_events(tid, 50)
+
+    # Branch health snapshot
+    branches = await db.branches.find({"tenant_id": tid, "is_active": True}, {"_id": 0}).to_list(100)
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).isoformat()
+    branch_health = []
+    for b in branches:
+        bid = b["id"]
+        products = await db.products.count_documents({"tenant_id": tid, "branch_id": bid})
+        low_stock = await db.products.count_documents({"tenant_id": tid, "branch_id": bid, "$expr": {"$lte": ["$stock", "$low_stock_threshold"]}})
+        out_of_stock = await db.products.count_documents({"tenant_id": tid, "branch_id": bid, "stock": {"$lte": 0}})
+        today_invoices = await db.invoices.find({"tenant_id": tid, "branch_id": bid, "created_at": {"$gte": today}}, {"_id": 0, "grand_total": 1}).to_list(5000)
+        today_revenue = sum(inv.get("grand_total", 0) for inv in today_invoices)
+        pending_transfers_in = await db.transfer_requests.count_documents({"tenant_id": tid, "target_branch_id": bid, "status": "pending"})
+        pending_transfers_out = await db.transfer_requests.count_documents({"tenant_id": tid, "source_branch_id": bid, "status": "pending"})
+        health_score = 100
+        if products > 0:
+            health_score -= min(30, int(low_stock / products * 100))
+            health_score -= min(30, int(out_of_stock / products * 100))
+        if pending_transfers_in > 5:
+            health_score -= 10
+        branch_health.append({
+            "branch_id": bid, "name": b.get("name", ""), "code": b.get("code", ""),
+            "products": products, "low_stock": low_stock, "out_of_stock": out_of_stock,
+            "today_revenue": round(today_revenue, 2), "today_orders": len(today_invoices),
+            "pending_transfers_in": pending_transfers_in, "pending_transfers_out": pending_transfers_out,
+            "health_score": max(0, health_score),
+        })
+
+    # Stock movement summary (last 24h)
+    yesterday = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    recent_invoices = await db.invoices.find({"tenant_id": tid, "created_at": {"$gte": yesterday}}, {"_id": 0, "items": 1, "branch_id": 1, "created_at": 1, "grand_total": 1}).to_list(5000)
+    items_sold_24h = sum(sum(it.get("quantity", 0) for it in inv.get("items", [])) for inv in recent_invoices)
+    revenue_24h = sum(inv.get("grand_total", 0) for inv in recent_invoices)
+
+    recent_transfers = await db.transfer_requests.find({"tenant_id": tid, "created_at": {"$gte": yesterday}}, {"_id": 0}).to_list(500)
+    transfers_24h = len(recent_transfers)
+
+    # Hourly activity (last 24h)
+    hourly_activity = [{"hour": h, "orders": 0, "revenue": 0} for h in range(24)]
+    for inv in recent_invoices:
+        try:
+            dt = datetime.fromisoformat(inv["created_at"].replace("Z", "+00:00"))
+            h = dt.hour
+            hourly_activity[h]["orders"] += 1
+            hourly_activity[h]["revenue"] += inv.get("grand_total", 0)
+        except Exception:
+            pass
+    for h in hourly_activity:
+        h["revenue"] = round(h["revenue"], 2)
+
+    # Top moving products (last 24h)
+    product_moves = {}
+    for inv in recent_invoices:
+        for item in inv.get("items", []):
+            pid = item.get("product_id", "")
+            if pid not in product_moves:
+                product_moves[pid] = {"name": item.get("name", ""), "qty": 0, "revenue": 0}
+            product_moves[pid]["qty"] += item.get("quantity", 0)
+            product_moves[pid]["revenue"] += item.get("total", item.get("price", 0) * item.get("quantity", 0))
+    top_movers = sorted(product_moves.values(), key=lambda x: x["qty"], reverse=True)[:10]
+    for m in top_movers:
+        m["revenue"] = round(m["revenue"], 2)
+
+    # Connected clients
+    connected = ws_manager.get_stats()
+
+    return {
+        "branch_health": branch_health,
+        "live_stats": {
+            "orders_24h": len(recent_invoices), "items_sold_24h": items_sold_24h,
+            "revenue_24h": round(revenue_24h, 2), "transfers_24h": transfers_24h,
+            "connected_clients": connected.get(tid, 0),
+        },
+        "hourly_activity": hourly_activity,
+        "top_movers": top_movers,
+        "recent_events": recent_events[-20:],
+    }
+
+@api_router.get("/realtime/stock-alerts")
+async def realtime_stock_alerts(request: Request):
+    """Get critical stock alerts across all branches"""
+    user = await get_current_user(request)
+    tid = user["tenant_id"]
+
+    # Critical low stock across branches
+    low_stock = await db.products.find(
+        {"tenant_id": tid, "$expr": {"$lte": ["$stock", "$low_stock_threshold"]}, "stock": {"$gt": 0}},
+        {"_id": 0, "id": 1, "name": 1, "stock": 1, "low_stock_threshold": 1, "branch_id": 1, "price": 1, "category": 1}
+    ).sort("stock", 1).limit(50).to_list(50)
+
+    out_of_stock = await db.products.find(
+        {"tenant_id": tid, "stock": {"$lte": 0}},
+        {"_id": 0, "id": 1, "name": 1, "stock": 1, "branch_id": 1, "price": 1, "category": 1}
+    ).limit(50).to_list(50)
+
+    # Enrich with branch names
+    branches = await db.branches.find({"tenant_id": tid}, {"_id": 0, "id": 1, "name": 1}).to_list(100)
+    bmap = {b["id"]: b["name"] for b in branches}
+    for p in low_stock + out_of_stock:
+        p["branch_name"] = bmap.get(p.get("branch_id", ""), "Unassigned")
+
+    # Stock imbalances (same product, very different stock across branches)
+    imbalances = []
+    product_names = set()
+    for p in low_stock:
+        if p.get("name") and p["name"] not in product_names:
+            product_names.add(p["name"])
+            same_products = await db.products.find(
+                {"tenant_id": tid, "name": p["name"]},
+                {"_id": 0, "id": 1, "name": 1, "stock": 1, "branch_id": 1}
+            ).to_list(20)
+            if len(same_products) > 1:
+                stocks = [sp["stock"] for sp in same_products]
+                if max(stocks) > 0 and min(stocks) <= (p.get("low_stock_threshold", 10) or 10):
+                    for sp in same_products:
+                        sp["branch_name"] = bmap.get(sp.get("branch_id", ""), "Unassigned")
+                    imbalances.append({
+                        "product_name": p["name"], "branches": same_products,
+                        "min_stock": min(stocks), "max_stock": max(stocks),
+                    })
+            if len(imbalances) >= 10:
+                break
+
+    return {
+        "low_stock": low_stock, "out_of_stock": out_of_stock,
+        "imbalances": imbalances,
+        "summary": {
+            "low_stock_count": len(low_stock), "out_of_stock_count": len(out_of_stock),
+            "imbalance_count": len(imbalances),
+        }
+    }
 
 # ═══════════════════════════════════════════════════════════════════
 #  APP SETUP

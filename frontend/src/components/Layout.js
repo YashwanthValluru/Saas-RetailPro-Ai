@@ -16,6 +16,7 @@ import { Toaster } from '@/components/ui/sonner';
 
 const navItems = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+  { to: '/realtime', icon: Activity, label: 'Live Sync', roles: ['OWNER', 'MANAGER'], tenantOnly: true },
   { to: '/inventory', icon: Package, label: 'Inventory', tenantOnly: true },
   { to: '/categories', icon: FolderTree, label: 'Categories', tenantOnly: true },
   { to: '/pos', icon: ShoppingCart, label: 'POS / Billing', tenantOnly: true },
