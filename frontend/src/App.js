@@ -29,6 +29,13 @@ import AdvanceOrdersPage from '@/pages/AdvanceOrdersPage';
 import AnalyticsPage from '@/pages/AnalyticsPage';
 import RefillPredictionsPage from '@/pages/RefillPredictionsPage';
 import PublicReceiptPage from '@/pages/PublicReceiptPage';
+import BranchesPage from '@/pages/BranchesPage';
+import CategoriesPage from '@/pages/CategoriesPage';
+import BulkUploadPage from '@/pages/BulkUploadPage';
+import BarcodePrintPage from '@/pages/BarcodePrintPage';
+import ProfitDashboardPage from '@/pages/ProfitDashboardPage';
+import ExpiryDashboardPage from '@/pages/ExpiryDashboardPage';
+import SalesTrendsPage from '@/pages/SalesTrendsPage';
 import '@/App.css';
 
 function ProtectedRoute({ children, roles, adminAccess }) {
@@ -85,6 +92,13 @@ function AppRoutes() {
       <Route path="/advance-orders" element={<ProtectedRoute><AdvanceOrdersPage /></ProtectedRoute>} />
             <Route path="/analytics" element={<ProtectedRoute adminAccess><AnalyticsPage /></ProtectedRoute>} />
       <Route path="/refill-predictions" element={<ProtectedRoute roles={['OWNER', 'MANAGER']}><RefillPredictionsPage /></ProtectedRoute>} />
+      <Route path="/branches" element={<ProtectedRoute roles={['OWNER', 'MANAGER']}><BranchesPage /></ProtectedRoute>} />
+      <Route path="/categories" element={<ProtectedRoute><CategoriesPage /></ProtectedRoute>} />
+      <Route path="/bulk-upload" element={<ProtectedRoute roles={['OWNER', 'MANAGER']}><BulkUploadPage /></ProtectedRoute>} />
+      <Route path="/barcode-print" element={<ProtectedRoute><BarcodePrintPage /></ProtectedRoute>} />
+      <Route path="/profit-dashboard" element={<ProtectedRoute roles={['OWNER', 'MANAGER']}><ProfitDashboardPage /></ProtectedRoute>} />
+      <Route path="/expiry-dashboard" element={<ProtectedRoute><ExpiryDashboardPage /></ProtectedRoute>} />
+      <Route path="/sales-trends" element={<ProtectedRoute roles={['OWNER', 'MANAGER']}><SalesTrendsPage /></ProtectedRoute>} />
       <Route path="/receipt/:shareToken" element={<PublicReceiptPage />} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="/dashboard" replace />} />

@@ -7,7 +7,8 @@ import {
   LayoutDashboard, Package, ShoppingCart, BarChart3, Users, Settings,
   ChevronLeft, ChevronRight, LogOut, Shield, ScrollText, Store, Brain, Truck,
   UserCheck, Key, Moon, Sun, TicketCheck, ShieldAlert, Building2, KeyRound,
-  Tag, RefreshCw, CreditCard, Menu, Activity, Bell
+  Tag, RefreshCw, CreditCard, Menu, Activity, Bell, FolderTree, Upload,
+  Barcode, TrendingUp, AlertTriangle, GitBranch
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
@@ -16,12 +17,19 @@ import { Toaster } from '@/components/ui/sonner';
 const navItems = [
   { to: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/inventory', icon: Package, label: 'Inventory', tenantOnly: true },
+  { to: '/categories', icon: FolderTree, label: 'Categories', tenantOnly: true },
   { to: '/pos', icon: ShoppingCart, label: 'POS / Billing', tenantOnly: true },
   { to: '/purchases', icon: Truck, label: 'Purchases', tenantOnly: true },
   { to: '/customers', icon: UserCheck, label: 'Customers', tenantOnly: true },
   { to: '/reports', icon: BarChart3, label: 'Reports', tenantOnly: true },
+  { to: '/profit-dashboard', icon: TrendingUp, label: 'Profit Analysis', roles: ['OWNER', 'MANAGER'], tenantOnly: true },
+  { to: '/sales-trends', icon: Activity, label: 'Sales Trends', roles: ['OWNER', 'MANAGER'], tenantOnly: true },
+  { to: '/expiry-dashboard', icon: AlertTriangle, label: 'Expiry Alerts', tenantOnly: true },
   { to: '/analytics', icon: Activity, label: 'Analytics', roles: ['OWNER', 'MANAGER'], showForAdmin: true },
   { to: '/forecast', icon: Brain, label: 'AI Forecast', plans: ['premium', 'standard'], tenantOnly: true },
+  { to: '/branches', icon: GitBranch, label: 'Branches', plans: ['premium'], roles: ['OWNER', 'MANAGER'], tenantOnly: true },
+  { to: '/bulk-upload', icon: Upload, label: 'Bulk Upload', roles: ['OWNER', 'MANAGER'], tenantOnly: true },
+  { to: '/barcode-print', icon: Barcode, label: 'Barcode Labels', tenantOnly: true },
   { to: '/promo-codes', icon: Tag, label: 'Promo Codes', plans: ['premium'], tenantOnly: true },
   { to: '/reorder', icon: RefreshCw, label: 'Auto Reorder', plans: ['premium'], roles: ['OWNER', 'MANAGER'], tenantOnly: true },
   { to: '/advance-orders', icon: CreditCard, label: 'Advance Orders', plans: ['premium'], tenantOnly: true },

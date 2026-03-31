@@ -41,7 +41,9 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
+import barcode as python_barcode
+from barcode.writer import ImageWriter
 
 # ─── Config ───────────────────────────────────────────────────────
 mongo_url = os.environ['MONGO_URL']
@@ -436,6 +438,41 @@ class CreateAdminAccount(BaseModel):
     email: str
     password: str
     name: str
+
+# ─── Branch Models ───────────────────────────────────────────────
+
+class BranchCreate(BaseModel):
+    name: str
+    code: str = ""
+    address: str = ""
+    phone: str = ""
+    manager_name: str = ""
+    is_main: bool = False
+
+class BranchUpdate(BaseModel):
+    name: Optional[str] = None
+    code: Optional[str] = None
+    address: Optional[str] = None
+    phone: Optional[str] = None
+    manager_name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+# ─── Category Hierarchy Models ───────────────────────────────────
+
+class CategoryCreate(BaseModel):
+    name: str
+    parent_id: Optional[str] = None
+    description: str = ""
+    icon: str = ""
+    sort_order: int = 0
+
+class CategoryUpdate(BaseModel):
+    name: Optional[str] = None
+    parent_id: Optional[str] = None
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
 
 # ─── Utility Functions ────────────────────────────────────────────
 
@@ -3208,9 +3245,12 @@ async def list_access_requests(request: Request, status: str = "", page: int = 1
     user = await get_current_user(request)
 
     if user.get("is_platform_admin") or user.get("is_admin"):
-        if user["role"] != "OWNER":
-            raise HTTPException(403, "Only OWNER can view access requests")
+        # Admins/platform admins see all requests (or their own)
+        query = {"admin_id": user["id"]}
+    elif user["role"] == "OWNER":
         query = {"tenant_id": user["tenant_id"]}
+    else:
+        raise HTTPException(403, "Only OWNER can view access requests")
 
     if status:
         query["status"] = status
@@ -5045,6 +5085,945 @@ async def send_refill_reminder(request: Request):
     }
 
 # ═══════════════════════════════════════════════════════════════════
+#  MULTI-BRANCH MANAGEMENT (Premium)
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.post("/branches")
+async def create_branch(req: BranchCreate, request: Request):
+    user = await get_current_user(request)
+    await require_premium(user)
+    if user["role"] != "OWNER":
+        raise HTTPException(403, "Only OWNER can manage branches")
+    if req.code:
+        existing = await db.branches.find_one({"tenant_id": user["tenant_id"], "code": req.code})
+        if existing:
+            raise HTTPException(400, "Branch code already exists")
+    doc = req.model_dump()
+    doc["id"] = str(uuid.uuid4())
+    doc["tenant_id"] = user["tenant_id"]
+    doc["is_active"] = True
+    doc["created_at"] = datetime.now(timezone.utc).isoformat()
+    await db.branches.insert_one(doc)
+    await log_audit(user["tenant_id"], user["id"], "branch_created", f"Branch: {req.name}", request.client.host if request.client else "")
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/branches")
+async def list_branches(request: Request):
+    user = await get_current_user(request)
+    branches = await db.branches.find({"tenant_id": user["tenant_id"]}, {"_id": 0}).sort("name", 1).to_list(100)
+    for b in branches:
+        b["product_count"] = await db.products.count_documents({"tenant_id": user["tenant_id"], "branch_id": b["id"]})
+        b["user_count"] = await db.users.count_documents({"tenant_id": user["tenant_id"], "branch_id": b["id"]})
+    return {"branches": branches}
+
+@api_router.put("/branches/{branch_id}")
+async def update_branch(branch_id: str, req: BranchUpdate, request: Request):
+    user = await get_current_user(request)
+    await require_premium(user)
+    if user["role"] != "OWNER":
+        raise HTTPException(403, "Only OWNER can manage branches")
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = await db.branches.update_one({"id": branch_id, "tenant_id": user["tenant_id"]}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(404, "Branch not found")
+    await log_audit(user["tenant_id"], user["id"], "branch_updated", f"Branch: {branch_id}", request.client.host if request.client else "")
+    return {"message": "Branch updated"}
+
+@api_router.delete("/branches/{branch_id}")
+async def delete_branch(branch_id: str, request: Request):
+    user = await get_current_user(request)
+    await require_premium(user)
+    if user["role"] != "OWNER":
+        raise HTTPException(403, "Only OWNER can manage branches")
+    product_count = await db.products.count_documents({"tenant_id": user["tenant_id"], "branch_id": branch_id})
+    if product_count > 0:
+        raise HTTPException(400, f"Cannot delete branch with {product_count} products. Transfer them first.")
+    result = await db.branches.delete_one({"id": branch_id, "tenant_id": user["tenant_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Branch not found")
+    await log_audit(user["tenant_id"], user["id"], "branch_deleted", f"Branch: {branch_id}", request.client.host if request.client else "")
+    return {"message": "Branch deleted"}
+
+@api_router.get("/branches/{branch_id}/stats")
+async def branch_stats(branch_id: str, request: Request):
+    user = await get_current_user(request)
+    await require_premium(user)
+    branch = await db.branches.find_one({"id": branch_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not branch:
+        raise HTTPException(404, "Branch not found")
+    tid = user["tenant_id"]
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).isoformat()
+    total_products = await db.products.count_documents({"tenant_id": tid, "branch_id": branch_id})
+    total_invoices = await db.invoices.count_documents({"tenant_id": tid, "branch_id": branch_id})
+    today_invoices = await db.invoices.find({"tenant_id": tid, "branch_id": branch_id, "created_at": {"$gte": today}}, {"_id": 0, "grand_total": 1}).to_list(5000)
+    today_revenue = sum(inv.get("grand_total", 0) for inv in today_invoices)
+    low_stock = await db.products.count_documents({"tenant_id": tid, "branch_id": branch_id, "$expr": {"$lte": ["$stock", "$low_stock_threshold"]}})
+    return {
+        "branch": branch, "total_products": total_products, "total_invoices": total_invoices,
+        "today_revenue": round(today_revenue, 2), "today_orders": len(today_invoices), "low_stock_count": low_stock
+    }
+
+@api_router.post("/branches/transfer-products")
+async def transfer_products(request: Request):
+    user = await get_current_user(request)
+    await require_premium(user)
+    if user["role"] != "OWNER":
+        raise HTTPException(403, "Only OWNER can transfer products")
+    body = await request.json()
+    product_ids = body.get("product_ids", [])
+    target_branch_id = body.get("target_branch_id", "")
+    if not product_ids or not target_branch_id:
+        raise HTTPException(400, "product_ids and target_branch_id required")
+    target = await db.branches.find_one({"id": target_branch_id, "tenant_id": user["tenant_id"]})
+    if not target:
+        raise HTTPException(404, "Target branch not found")
+    result = await db.products.update_many(
+        {"id": {"$in": product_ids}, "tenant_id": user["tenant_id"]},
+        {"$set": {"branch_id": target_branch_id, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    product_cache.invalidate(user["tenant_id"])
+    await log_audit(user["tenant_id"], user["id"], "products_transferred", f"{result.modified_count} products → branch {target_branch_id}", request.client.host if request.client else "")
+    return {"message": f"{result.modified_count} products transferred"}
+
+# ═══════════════════════════════════════════════════════════════════
+#  CATEGORY HIERARCHY MANAGEMENT
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.post("/categories")
+async def create_category(req: CategoryCreate, request: Request):
+    user = await get_current_user(request)
+    if user["role"] == "STAFF":
+        raise HTTPException(403, "Staff cannot manage categories")
+    if req.parent_id:
+        parent = await db.categories.find_one({"id": req.parent_id, "tenant_id": user["tenant_id"]})
+        if not parent:
+            raise HTTPException(404, "Parent category not found")
+        level = parent.get("level", 0) + 1
+        path = parent.get("path", []) + [parent["id"]]
+    else:
+        level = 0
+        path = []
+    doc = req.model_dump()
+    doc["id"] = str(uuid.uuid4())
+    doc["tenant_id"] = user["tenant_id"]
+    doc["level"] = level
+    doc["path"] = path
+    doc["is_active"] = True
+    doc["product_count"] = 0
+    doc["created_at"] = datetime.now(timezone.utc).isoformat()
+    await db.categories.insert_one(doc)
+    category_cache.invalidate(user["tenant_id"])
+    await log_audit(user["tenant_id"], user["id"], "category_created", f"Category: {req.name}", request.client.host if request.client else "")
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/categories")
+async def list_categories_hierarchy(request: Request, flat: bool = False):
+    user = await get_current_user(request)
+    cats = await db.categories.find({"tenant_id": user["tenant_id"]}, {"_id": 0}).sort("sort_order", 1).to_list(1000)
+    # Update product counts
+    for c in cats:
+        c["product_count"] = await db.products.count_documents({"tenant_id": user["tenant_id"], "category_id": c["id"]})
+    if flat:
+        return {"categories": cats}
+    # Build tree
+    cat_map = {c["id"]: {**c, "children": []} for c in cats}
+    roots = []
+    for c in cats:
+        node = cat_map[c["id"]]
+        if c.get("parent_id") and c["parent_id"] in cat_map:
+            cat_map[c["parent_id"]]["children"].append(node)
+        else:
+            roots.append(node)
+    return {"categories": roots, "total": len(cats)}
+
+@api_router.put("/categories/{category_id}")
+async def update_category(category_id: str, req: CategoryUpdate, request: Request):
+    user = await get_current_user(request)
+    if user["role"] == "STAFF":
+        raise HTTPException(403, "Staff cannot manage categories")
+    updates = {k: v for k, v in req.model_dump().items() if v is not None}
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+    result = await db.categories.update_one({"id": category_id, "tenant_id": user["tenant_id"]}, {"$set": updates})
+    if result.modified_count == 0:
+        raise HTTPException(404, "Category not found")
+    category_cache.invalidate(user["tenant_id"])
+    return {"message": "Category updated"}
+
+@api_router.delete("/categories/{category_id}")
+async def delete_category(category_id: str, request: Request):
+    user = await get_current_user(request)
+    if user["role"] not in ["OWNER", "MANAGER"]:
+        raise HTTPException(403, "Insufficient permissions")
+    children = await db.categories.count_documents({"tenant_id": user["tenant_id"], "parent_id": category_id})
+    if children > 0:
+        raise HTTPException(400, f"Cannot delete category with {children} subcategories. Delete them first.")
+    products = await db.products.count_documents({"tenant_id": user["tenant_id"], "category_id": category_id})
+    if products > 0:
+        raise HTTPException(400, f"Cannot delete category with {products} products. Reassign them first.")
+    result = await db.categories.delete_one({"id": category_id, "tenant_id": user["tenant_id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Category not found")
+    category_cache.invalidate(user["tenant_id"])
+    return {"message": "Category deleted"}
+
+# ═══════════════════════════════════════════════════════════════════
+#  BULK UPLOAD (CSV / Excel / JSON)
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.post("/inventory/bulk-upload")
+async def bulk_upload_products(request: Request):
+    user = await get_current_user(request)
+    if user["role"] == "STAFF":
+        raise HTTPException(403, "Staff cannot upload products")
+
+    content_type = request.headers.get("content-type", "")
+    body = await request.body()
+
+    products = []
+    errors = []
+
+    if "application/json" in content_type:
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict):
+                products = data.get("products", [])
+            elif isinstance(data, list):
+                products = data
+        except Exception as e:
+            raise HTTPException(400, f"Invalid JSON: {str(e)}")
+
+    elif "text/csv" in content_type or "csv" in content_type:
+        try:
+            text = body.decode("utf-8")
+            reader = csv.DictReader(io.StringIO(text))
+            for row in reader:
+                products.append(row)
+        except Exception as e:
+            raise HTTPException(400, f"Invalid CSV: {str(e)}")
+
+    elif "spreadsheet" in content_type or "excel" in content_type or "octet-stream" in content_type:
+        try:
+            wb = load_workbook(filename=io.BytesIO(body), read_only=True)
+            ws = wb.active
+            headers = [cell.value for cell in ws[1]]
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if any(v is not None for v in row):
+                    products.append(dict(zip(headers, row)))
+        except Exception as e:
+            raise HTTPException(400, f"Invalid Excel file: {str(e)}")
+    else:
+        raise HTTPException(400, "Unsupported format. Use JSON, CSV, or Excel (.xlsx)")
+
+    if not products:
+        raise HTTPException(400, "No products found in upload")
+    if len(products) > 10000:
+        raise HTTPException(400, "Maximum 10,000 products per upload")
+
+    created = 0
+    updated = 0
+    skipped = 0
+    branch_id = ""
+
+    for i, p in enumerate(products):
+        try:
+            name = str(p.get("name", "")).strip()
+            if not name:
+                errors.append({"row": i + 2, "error": "Missing product name"})
+                skipped += 1
+                continue
+            sku = str(p.get("sku", "")).strip()
+            barcode_val = str(p.get("barcode", "")).strip()
+            branch_id = str(p.get("branch_id", "")).strip()
+
+            # Check for existing by SKU or barcode
+            existing = None
+            if sku:
+                existing = await db.products.find_one({"tenant_id": user["tenant_id"], "sku": sku})
+            if not existing and barcode_val:
+                existing = await db.products.find_one({"tenant_id": user["tenant_id"], "barcode": barcode_val})
+
+            doc = {
+                "name": name,
+                "sku": sku,
+                "barcode": barcode_val,
+                "category": str(p.get("category", "")).strip(),
+                "category_id": str(p.get("category_id", "")).strip(),
+                "price": float(p.get("price", 0) or 0),
+                "cost_price": float(p.get("cost_price", 0) or 0),
+                "stock": int(float(p.get("stock", 0) or 0)),
+                "low_stock_threshold": int(float(p.get("low_stock_threshold", 10) or 10)),
+                "unit": str(p.get("unit", "pcs")).strip() or "pcs",
+                "batch_number": str(p.get("batch_number", "")).strip(),
+                "expiry_date": str(p.get("expiry_date", "")).strip() if p.get("expiry_date") else "",
+                "description": str(p.get("description", "")).strip(),
+                "hsn_code": str(p.get("hsn_code", "")).strip(),
+                "gst_rate": float(p.get("gst_rate", 0) or 0),
+                "branch_id": branch_id,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            if existing:
+                await db.products.update_one({"_id": existing["_id"]}, {"$set": doc})
+                updated += 1
+            else:
+                doc["id"] = str(uuid.uuid4())
+                doc["tenant_id"] = user["tenant_id"]
+                doc["created_at"] = datetime.now(timezone.utc).isoformat()
+                doc["created_by"] = user["id"]
+                await db.products.insert_one(doc)
+                created += 1
+        except Exception as e:
+            errors.append({"row": i + 2, "error": str(e)})
+            skipped += 1
+
+    product_cache.invalidate(user["tenant_id"])
+    category_cache.invalidate(user["tenant_id"])
+    await log_audit(user["tenant_id"], user["id"], "bulk_upload",
+                    f"Created: {created}, Updated: {updated}, Skipped: {skipped}",
+                    request.client.host if request.client else "")
+
+    return {
+        "message": f"Bulk upload complete",
+        "created": created, "updated": updated, "skipped": skipped,
+        "total_processed": len(products), "errors": errors[:50]
+    }
+
+@api_router.get("/inventory/bulk-template")
+async def get_bulk_template(request: Request, format: str = "csv"):
+    user = await get_current_user(request)
+    headers = ["name", "sku", "barcode", "category", "price", "cost_price", "stock",
+               "low_stock_threshold", "unit", "batch_number", "expiry_date", "description",
+               "hsn_code", "gst_rate", "branch_id"]
+    sample = ["Sample Product", "SKU001", "8901234567890", "General", "100.00", "80.00",
+              "50", "10", "pcs", "BATCH001", "2027-12-31", "Sample description",
+              "3004", "12", ""]
+
+    if format == "json":
+        template = {"products": [dict(zip(headers, sample))]}
+        return JSONResponse(content=template, headers={"Content-Disposition": "attachment; filename=bulk_template.json"})
+    elif format == "excel":
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Products"
+        ws.append(headers)
+        ws.append(sample)
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               headers={"Content-Disposition": "attachment; filename=bulk_template.xlsx"})
+    else:
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(headers)
+        writer.writerow(sample)
+        buf.seek(0)
+        return StreamingResponse(io.BytesIO(buf.getvalue().encode()), media_type="text/csv",
+                               headers={"Content-Disposition": "attachment; filename=bulk_template.csv"})
+
+# ═══════════════════════════════════════════════════════════════════
+#  BARCODE LABEL PRINTING
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.post("/inventory/barcode-labels")
+async def generate_barcode_labels(request: Request):
+    user = await get_current_user(request)
+    body = await request.json()
+    product_ids = body.get("product_ids", [])
+    label_size = body.get("label_size", "medium")  # small, medium, large
+    copies = min(int(body.get("copies", 1)), 10)
+
+    if not product_ids:
+        raise HTTPException(400, "No product IDs provided")
+    if len(product_ids) > 100:
+        raise HTTPException(400, "Maximum 100 products per batch")
+
+    products = []
+    for pid in product_ids:
+        p = await db.products.find_one({"id": pid, "tenant_id": user["tenant_id"]}, {"_id": 0})
+        if p:
+            products.append(p)
+
+    if not products:
+        raise HTTPException(404, "No products found")
+
+    # Generate PDF with barcode labels
+    sizes = {
+        "small": {"w": 38*mm, "h": 25*mm, "cols": 5, "font": 6},
+        "medium": {"w": 50*mm, "h": 30*mm, "cols": 4, "font": 7},
+        "large": {"w": 70*mm, "h": 40*mm, "cols": 3, "font": 8},
+    }
+    sz = sizes.get(label_size, sizes["medium"])
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4, topMargin=10*mm, bottomMargin=10*mm, leftMargin=5*mm, rightMargin=5*mm)
+    styles = getSampleStyleSheet()
+    label_style = ParagraphStyle('Label', parent=styles['Normal'], fontSize=sz["font"], alignment=TA_CENTER, leading=sz["font"] + 2)
+    price_style = ParagraphStyle('Price', parent=styles['Normal'], fontSize=sz["font"] + 2, alignment=TA_CENTER, leading=sz["font"] + 4, fontName='Helvetica-Bold')
+
+    all_labels = []
+    for p in products:
+        for _ in range(copies):
+            all_labels.append(p)
+
+    # Build table of labels
+    table_data = []
+    row = []
+    for p in all_labels:
+        barcode_val = p.get("barcode") or p.get("sku") or p.get("id", "")[:12]
+        # Generate barcode image
+        try:
+            code128 = python_barcode.get("code128", barcode_val, writer=ImageWriter())
+            bc_buffer = io.BytesIO()
+            code128.write(bc_buffer, options={"module_width": 0.25, "module_height": 8, "font_size": 6, "text_distance": 1, "quiet_zone": 1})
+            bc_buffer.seek(0)
+            from reportlab.platypus import Image as RLImage
+            bc_img = RLImage(bc_buffer, width=sz["w"] - 4*mm, height=12*mm)
+        except Exception:
+            bc_img = Paragraph(barcode_val, label_style)
+
+        cell_content = [
+            Paragraph(p.get("name", "")[:30], label_style),
+            bc_img,
+            Paragraph(f"₹{p.get('price', 0):.2f}", price_style),
+        ]
+        cell = Table([[c] for c in cell_content], colWidths=[sz["w"] - 2*mm])
+        cell.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOX', (0, 0), (-1, -1), 0.5, colors.HexColor('#94A3B8')),
+            ('TOPPADDING', (0, 0), (-1, -1), 1*mm),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 1*mm),
+        ]))
+        row.append(cell)
+        if len(row) >= sz["cols"]:
+            table_data.append(row)
+            row = []
+
+    if row:
+        while len(row) < sz["cols"]:
+            row.append("")
+        table_data.append(row)
+
+    if table_data:
+        main_table = Table(table_data, colWidths=[sz["w"]] * sz["cols"])
+        main_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 1*mm),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 1*mm),
+            ('TOPPADDING', (0, 0), (-1, -1), 1*mm),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 1*mm),
+        ]))
+        doc.build([main_table])
+    else:
+        doc.build([Paragraph("No labels to generate", styles['Normal'])])
+
+    buffer.seek(0)
+    await log_audit(user["tenant_id"], user["id"], "barcode_labels_generated", f"{len(all_labels)} labels", request.client.host if request.client else "")
+    return StreamingResponse(buffer, media_type="application/pdf",
+                           headers={"Content-Disposition": "attachment; filename=barcode_labels.pdf"})
+
+# ═══════════════════════════════════════════════════════════════════
+#  INVOICE EMAIL SENDING
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.post("/pos/invoices/{invoice_id}/email")
+async def email_invoice(invoice_id: str, request: Request):
+    user = await get_current_user(request)
+    body = await request.json()
+    recipient_email = body.get("email", "")
+    if not recipient_email:
+        raise HTTPException(400, "Recipient email required")
+
+    invoice = await db.invoices.find_one({"id": invoice_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not invoice:
+        raise HTTPException(404, "Invoice not found")
+
+    tenant = await db.tenants.find_one({"id": user["tenant_id"]}, {"_id": 0})
+    shop_name = tenant.get("shop_name", "RetailPro") if tenant else "RetailPro"
+
+    # Build HTML email
+    items_html = ""
+    for item in invoice.get("items", []):
+        items_html += f"<tr><td style='padding:6px;border-bottom:1px solid #eee'>{item['name']}</td><td style='padding:6px;border-bottom:1px solid #eee;text-align:center'>{item['quantity']}</td><td style='padding:6px;border-bottom:1px solid #eee;text-align:right'>₹{item['price']:.2f}</td><td style='padding:6px;border-bottom:1px solid #eee;text-align:right'>₹{item.get('total', item['price']*item['quantity']):.2f}</td></tr>"
+
+    html_body = f"""
+    <div style='max-width:600px;margin:auto;font-family:sans-serif;color:#333'>
+      <div style='background:#0F172A;color:white;padding:20px;text-align:center'>
+        <h1 style='margin:0;font-size:24px'>{shop_name}</h1>
+        <p style='margin:5px 0 0;opacity:0.8'>Invoice #{invoice.get('invoice_number','')}</p>
+      </div>
+      <div style='padding:20px'>
+        <p><strong>Date:</strong> {invoice.get('created_at','')[:19].replace('T',' ')}</p>
+        <p><strong>Customer:</strong> {invoice.get('customer_name','Walk-in')}</p>
+        <p><strong>Payment:</strong> {invoice.get('payment_method','cash').upper()}</p>
+        <table style='width:100%;border-collapse:collapse;margin:15px 0'>
+          <tr style='background:#F1F5F9'><th style='padding:8px;text-align:left'>Item</th><th style='padding:8px;text-align:center'>Qty</th><th style='padding:8px;text-align:right'>Price</th><th style='padding:8px;text-align:right'>Total</th></tr>
+          {items_html}
+        </table>
+        <div style='text-align:right;margin-top:10px'>
+          <p>Subtotal: ₹{invoice.get('subtotal',0):.2f}</p>
+          <p>Tax (GST): ₹{invoice.get('tax_total',0):.2f}</p>
+          {"<p>Discount: -₹" + f"{invoice.get('discount',0):.2f}</p>" if invoice.get('discount',0) > 0 else ""}
+          <p style='font-size:18px;font-weight:bold;color:#0F172A'>Grand Total: ₹{invoice.get('grand_total',0):.2f}</p>
+        </div>
+      </div>
+      <div style='background:#F8FAFC;padding:15px;text-align:center;color:#64748B;font-size:12px'>
+        Thank you for your business! | Powered by RetailPro
+      </div>
+    </div>"""
+
+    subject = f"Invoice {invoice.get('invoice_number','')} from {shop_name}"
+    sent = await send_email_notification(user["tenant_id"], recipient_email, subject, html_body)
+
+    await log_audit(user["tenant_id"], user["id"], "invoice_emailed",
+                    f"Invoice {invoice.get('invoice_number','')} emailed to {recipient_email}",
+                    request.client.host if request.client else "")
+
+    return {"message": "Invoice email sent" if sent else "Email sending failed. Check SMTP settings.", "sent": sent}
+
+# ═══════════════════════════════════════════════════════════════════
+#  ADVANCED PROFIT MARGIN DASHBOARD
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.get("/reports/profit-dashboard")
+async def advanced_profit_dashboard(request: Request, period: str = "30d", branch_id: str = ""):
+    user = await get_current_user(request)
+    if not get_user_permission(user, "can_view_revenue"):
+        raise HTTPException(403, "Permission denied")
+
+    tid = user["tenant_id"]
+    days = {"7d": 7, "30d": 30, "90d": 90, "365d": 365}.get(period, 30)
+    start_date = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    prev_start = (datetime.now(timezone.utc) - timedelta(days=days * 2)).isoformat()
+
+    query = {"tenant_id": tid, "created_at": {"$gte": start_date}}
+    prev_query = {"tenant_id": tid, "created_at": {"$gte": prev_start, "$lt": start_date}}
+    if branch_id:
+        query["branch_id"] = branch_id
+        prev_query["branch_id"] = branch_id
+
+    invoices = await db.invoices.find(query, {"_id": 0}).to_list(50000)
+    prev_invoices = await db.invoices.find(prev_query, {"_id": 0}).to_list(50000)
+
+    # Product-level profit analysis
+    prod_map = {}
+    products_list = await db.products.find({"tenant_id": tid}, {"_id": 0, "id": 1, "cost_price": 1, "category": 1, "name": 1}).to_list(50000)
+    cost_map = {p["id"]: p for p in products_list}
+
+    product_data = {}
+    daily_profit = {}
+    category_profit = {}
+
+    for inv in invoices:
+        inv_date = inv.get("created_at", "")[:10]
+        for item in inv.get("items", []):
+            pid = item.get("product_id", "")
+            revenue = item.get("total", item["price"] * item["quantity"])
+            cost = cost_map.get(pid, {}).get("cost_price", 0) * item["quantity"]
+            profit = revenue - cost
+            cat = cost_map.get(pid, {}).get("category", "Uncategorized") or "Uncategorized"
+
+            if pid not in product_data:
+                product_data[pid] = {"name": item["name"], "revenue": 0, "cost": 0, "qty": 0, "category": cat}
+            product_data[pid]["revenue"] += revenue
+            product_data[pid]["cost"] += cost
+            product_data[pid]["qty"] += item["quantity"]
+
+            daily_profit[inv_date] = daily_profit.get(inv_date, {"revenue": 0, "cost": 0})
+            daily_profit[inv_date]["revenue"] += revenue
+            daily_profit[inv_date]["cost"] += cost
+
+            if cat not in category_profit:
+                category_profit[cat] = {"revenue": 0, "cost": 0, "qty": 0}
+            category_profit[cat]["revenue"] += revenue
+            category_profit[cat]["cost"] += cost
+            category_profit[cat]["qty"] += item["quantity"]
+
+    # Previous period totals
+    prev_revenue = sum(inv.get("grand_total", 0) for inv in prev_invoices)
+    prev_cost = 0
+    for inv in prev_invoices:
+        for item in inv.get("items", []):
+            prev_cost += cost_map.get(item.get("product_id", ""), {}).get("cost_price", 0) * item["quantity"]
+
+    total_revenue = sum(d["revenue"] for d in product_data.values())
+    total_cost = sum(d["cost"] for d in product_data.values())
+    total_profit = total_revenue - total_cost
+    prev_profit = prev_revenue - prev_cost
+
+    # Top/bottom products by margin
+    products_margins = []
+    for pid, data in product_data.items():
+        profit = data["revenue"] - data["cost"]
+        margin = (profit / data["revenue"] * 100) if data["revenue"] > 0 else 0
+        products_margins.append({
+            "product_id": pid, "name": data["name"], "category": data["category"],
+            "revenue": round(data["revenue"], 2), "cost": round(data["cost"], 2),
+            "profit": round(profit, 2), "margin_pct": round(margin, 1), "qty": data["qty"]
+        })
+    products_margins.sort(key=lambda x: x["profit"], reverse=True)
+
+    # Daily trend
+    daily_trend = []
+    for i in range(days - 1, -1, -1):
+        d = (datetime.now(timezone.utc) - timedelta(days=i)).strftime("%Y-%m-%d")
+        dp = daily_profit.get(d, {"revenue": 0, "cost": 0})
+        daily_trend.append({"date": d, "revenue": round(dp["revenue"], 2), "cost": round(dp["cost"], 2), "profit": round(dp["revenue"] - dp["cost"], 2)})
+
+    # Category breakdown
+    categories = []
+    for cat, data in category_profit.items():
+        profit = data["revenue"] - data["cost"]
+        margin = (profit / data["revenue"] * 100) if data["revenue"] > 0 else 0
+        share = (data["revenue"] / total_revenue * 100) if total_revenue > 0 else 0
+        categories.append({
+            "category": cat, "revenue": round(data["revenue"], 2), "cost": round(data["cost"], 2),
+            "profit": round(profit, 2), "margin_pct": round(margin, 1), "qty": data["qty"],
+            "revenue_share": round(share, 1)
+        })
+    categories.sort(key=lambda x: x["revenue"], reverse=True)
+
+    return {
+        "summary": {
+            "total_revenue": round(total_revenue, 2), "total_cost": round(total_cost, 2),
+            "total_profit": round(total_profit, 2),
+            "overall_margin": round((total_profit / total_revenue * 100) if total_revenue > 0 else 0, 1),
+            "prev_revenue": round(prev_revenue, 2), "prev_profit": round(prev_profit, 2),
+            "revenue_change": round(((total_revenue - prev_revenue) / prev_revenue * 100) if prev_revenue > 0 else 0, 1),
+            "profit_change": round(((total_profit - prev_profit) / prev_profit * 100) if prev_profit > 0 else 0, 1),
+        },
+        "top_products": products_margins[:15],
+        "bottom_products": list(reversed(products_margins[-10:])) if len(products_margins) > 10 else [],
+        "daily_trend": daily_trend[-30:],
+        "categories": categories,
+        "period": period
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+#  BATCH EXPIRY ALERT SYSTEM
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.get("/inventory/expiry-dashboard")
+async def expiry_dashboard(request: Request, branch_id: str = ""):
+    user = await get_current_user(request)
+    tid = user["tenant_id"]
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cutoff_30 = (datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y-%m-%d")
+    cutoff_90 = (datetime.now(timezone.utc) + timedelta(days=90)).strftime("%Y-%m-%d")
+    cutoff_180 = (datetime.now(timezone.utc) + timedelta(days=180)).strftime("%Y-%m-%d")
+
+    query = {"tenant_id": tid, "expiry_date": {"$nin": [None, ""]}}
+    if branch_id:
+        query["branch_id"] = branch_id
+
+    products = await db.products.find(query, {"_id": 0}).sort("expiry_date", 1).to_list(5000)
+
+    expired = []
+    critical = []  # 0-30 days
+    warning = []   # 30-90 days
+    notice = []    # 90-180 days
+    ok = []        # 180+ days
+
+    total_expired_value = 0
+    total_at_risk_value = 0
+
+    for p in products:
+        exp = p.get("expiry_date", "")
+        if not exp:
+            continue
+        exp_date = exp[:10]
+        stock_value = p.get("stock", 0) * p.get("cost_price", 0)
+
+        if exp_date <= today:
+            p["status"] = "expired"
+            p["days_until_expiry"] = 0
+            expired.append(p)
+            total_expired_value += stock_value
+        elif exp_date <= cutoff_30:
+            days_left = (datetime.fromisoformat(exp_date) - datetime.fromisoformat(today)).days
+            p["status"] = "critical"
+            p["days_until_expiry"] = days_left
+            critical.append(p)
+            total_at_risk_value += stock_value
+        elif exp_date <= cutoff_90:
+            days_left = (datetime.fromisoformat(exp_date) - datetime.fromisoformat(today)).days
+            p["status"] = "warning"
+            p["days_until_expiry"] = days_left
+            warning.append(p)
+        elif exp_date <= cutoff_180:
+            days_left = (datetime.fromisoformat(exp_date) - datetime.fromisoformat(today)).days
+            p["status"] = "notice"
+            p["days_until_expiry"] = days_left
+            notice.append(p)
+        else:
+            days_left = (datetime.fromisoformat(exp_date) - datetime.fromisoformat(today)).days
+            p["status"] = "ok"
+            p["days_until_expiry"] = days_left
+            ok.append(p)
+
+    # Category breakdown of expiring products
+    expiring_by_category = {}
+    for p in expired + critical + warning:
+        cat = p.get("category", "Uncategorized") or "Uncategorized"
+        if cat not in expiring_by_category:
+            expiring_by_category[cat] = {"count": 0, "value": 0}
+        expiring_by_category[cat]["count"] += 1
+        expiring_by_category[cat]["value"] += p.get("stock", 0) * p.get("cost_price", 0)
+
+    return {
+        "summary": {
+            "total_tracked": len(products), "total_expired": len(expired),
+            "total_critical": len(critical), "total_warning": len(warning),
+            "total_notice": len(notice), "total_ok": len(ok),
+            "expired_value": round(total_expired_value, 2),
+            "at_risk_value": round(total_at_risk_value, 2),
+        },
+        "expired": expired[:50], "critical": critical[:50],
+        "warning": warning[:50], "notice": notice[:50],
+        "by_category": [{"category": k, **v} for k, v in sorted(expiring_by_category.items(), key=lambda x: x[1]["count"], reverse=True)],
+    }
+
+# ═══════════════════════════════════════════════════════════════════
+#  SUPERMARKET ADVANCED ANALYTICS
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.get("/analytics/sales-trends")
+async def sales_trends(request: Request, period: str = "30d", branch_id: str = ""):
+    user = await get_current_user(request)
+    if user["role"] not in ("OWNER", "MANAGER"):
+        raise HTTPException(403, "Requires OWNER or MANAGER")
+    tid = user["tenant_id"]
+    days = {"7d": 7, "30d": 30, "90d": 90}.get(period, 30)
+
+    query = {"tenant_id": tid}
+    if branch_id:
+        query["branch_id"] = branch_id
+
+    # Hourly distribution (all time last N days)
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    query["created_at"] = {"$gte": start}
+    invoices = await db.invoices.find(query, {"_id": 0, "created_at": 1, "grand_total": 1, "items": 1}).to_list(50000)
+
+    hourly = [{"hour": h, "orders": 0, "revenue": 0} for h in range(24)]
+    daily = {}
+    weekday = [{"day": d, "orders": 0, "revenue": 0} for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]]
+
+    for inv in invoices:
+        created = inv.get("created_at", "")
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            h = dt.hour
+            hourly[h]["orders"] += 1
+            hourly[h]["revenue"] += inv.get("grand_total", 0)
+            wd = dt.weekday()
+            weekday[wd]["orders"] += 1
+            weekday[wd]["revenue"] += inv.get("grand_total", 0)
+            d = created[:10]
+            if d not in daily:
+                daily[d] = {"date": d, "orders": 0, "revenue": 0, "items_sold": 0}
+            daily[d]["orders"] += 1
+            daily[d]["revenue"] += inv.get("grand_total", 0)
+            daily[d]["items_sold"] += sum(item.get("quantity", 0) for item in inv.get("items", []))
+        except Exception:
+            pass
+
+    for h in hourly:
+        h["revenue"] = round(h["revenue"], 2)
+    for w in weekday:
+        w["revenue"] = round(w["revenue"], 2)
+
+    daily_sorted = sorted(daily.values(), key=lambda x: x["date"])
+    for d in daily_sorted:
+        d["revenue"] = round(d["revenue"], 2)
+
+    # Peak hours
+    peak_hour = max(hourly, key=lambda x: x["revenue"])
+    peak_day = max(weekday, key=lambda x: x["revenue"])
+    avg_daily_revenue = round(sum(d["revenue"] for d in daily_sorted) / max(len(daily_sorted), 1), 2)
+
+    return {
+        "hourly": hourly, "daily": daily_sorted[-30:], "weekday": weekday,
+        "insights": {
+            "peak_hour": peak_hour["hour"], "peak_hour_revenue": peak_hour["revenue"],
+            "peak_day": peak_day["day"], "peak_day_revenue": peak_day["revenue"],
+            "avg_daily_revenue": avg_daily_revenue,
+            "total_orders": len(invoices),
+            "total_revenue": round(sum(inv.get("grand_total", 0) for inv in invoices), 2),
+        }
+    }
+
+@api_router.get("/analytics/branch-comparison")
+async def branch_comparison(request: Request, period: str = "30d"):
+    user = await get_current_user(request)
+    await require_premium(user)
+    if user["role"] != "OWNER":
+        raise HTTPException(403, "Only OWNER")
+    tid = user["tenant_id"]
+    days = {"7d": 7, "30d": 30, "90d": 90}.get(period, 30)
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    branches = await db.branches.find({"tenant_id": tid, "is_active": True}, {"_id": 0}).to_list(100)
+    if not branches:
+        return {"branches": [], "message": "No branches found"}
+
+    result = []
+    for b in branches:
+        bid = b["id"]
+        invoices = await db.invoices.find({"tenant_id": tid, "branch_id": bid, "created_at": {"$gte": start}}, {"_id": 0, "grand_total": 1}).to_list(50000)
+        revenue = sum(inv.get("grand_total", 0) for inv in invoices)
+        products = await db.products.count_documents({"tenant_id": tid, "branch_id": bid})
+        low_stock = await db.products.count_documents({"tenant_id": tid, "branch_id": bid, "$expr": {"$lte": ["$stock", "$low_stock_threshold"]}})
+        result.append({
+            "branch_id": bid, "name": b.get("name", ""),
+            "revenue": round(revenue, 2), "orders": len(invoices),
+            "avg_order_value": round(revenue / max(len(invoices), 1), 2),
+            "products": products, "low_stock": low_stock,
+        })
+
+    result.sort(key=lambda x: x["revenue"], reverse=True)
+    return {"branches": result, "period": period}
+
+@api_router.get("/analytics/customer-rfm")
+async def customer_rfm_analysis(request: Request, branch_id: str = ""):
+    """RFM (Recency, Frequency, Monetary) analysis for customer segmentation"""
+    user = await get_current_user(request)
+    if user["role"] not in ("OWNER", "MANAGER"):
+        raise HTTPException(403, "Requires OWNER or MANAGER")
+    tid = user["tenant_id"]
+
+    query = {"tenant_id": tid}
+    if branch_id:
+        query["branch_id"] = branch_id
+
+    invoices = await db.invoices.find(query, {"_id": 0, "customer_id": 1, "customer_name": 1, "grand_total": 1, "created_at": 1}).to_list(100000)
+
+    customer_data = {}
+    now = datetime.now(timezone.utc)
+    for inv in invoices:
+        cid = inv.get("customer_id", "") or inv.get("customer_name", "Walk-in")
+        if cid == "Walk-in" or not cid:
+            continue
+        if cid not in customer_data:
+            customer_data[cid] = {"name": inv.get("customer_name", ""), "last_purchase": "", "frequency": 0, "monetary": 0}
+        customer_data[cid]["frequency"] += 1
+        customer_data[cid]["monetary"] += inv.get("grand_total", 0)
+        created = inv.get("created_at", "")
+        if created > customer_data[cid]["last_purchase"]:
+            customer_data[cid]["last_purchase"] = created
+
+    segments = {"champions": [], "loyal": [], "at_risk": [], "lost": [], "new": []}
+    for cid, data in customer_data.items():
+        try:
+            last = datetime.fromisoformat(data["last_purchase"].replace("Z", "+00:00"))
+            recency_days = (now - last).days
+        except Exception:
+            recency_days = 999
+
+        # Simple RFM scoring
+        r_score = 5 if recency_days <= 7 else 4 if recency_days <= 30 else 3 if recency_days <= 60 else 2 if recency_days <= 90 else 1
+        f_score = 5 if data["frequency"] >= 20 else 4 if data["frequency"] >= 10 else 3 if data["frequency"] >= 5 else 2 if data["frequency"] >= 2 else 1
+        m_score = 5 if data["monetary"] >= 50000 else 4 if data["monetary"] >= 20000 else 3 if data["monetary"] >= 5000 else 2 if data["monetary"] >= 1000 else 1
+
+        total_score = r_score + f_score + m_score
+        if total_score >= 13:
+            segment = "champions"
+        elif total_score >= 10:
+            segment = "loyal"
+        elif r_score <= 2 and f_score >= 3:
+            segment = "at_risk"
+        elif r_score <= 2:
+            segment = "lost"
+        else:
+            segment = "new"
+
+        entry = {
+            "customer_id": cid, "name": data["name"],
+            "recency_days": recency_days, "frequency": data["frequency"],
+            "monetary": round(data["monetary"], 2),
+            "r_score": r_score, "f_score": f_score, "m_score": m_score,
+            "segment": segment
+        }
+        segments[segment].append(entry)
+
+    for seg in segments.values():
+        seg.sort(key=lambda x: x["monetary"], reverse=True)
+
+    return {
+        "segments": {k: v[:20] for k, v in segments.items()},
+        "summary": {k: len(v) for k, v in segments.items()},
+        "total_customers": len(customer_data)
+    }
+
+@api_router.get("/analytics/product-performance")
+async def product_performance(request: Request, period: str = "30d", branch_id: str = ""):
+    user = await get_current_user(request)
+    if user["role"] not in ("OWNER", "MANAGER"):
+        raise HTTPException(403, "Requires OWNER or MANAGER")
+    tid = user["tenant_id"]
+    days = {"7d": 7, "30d": 30, "90d": 90}.get(period, 30)
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    query = {"tenant_id": tid, "created_at": {"$gte": start}}
+    if branch_id:
+        query["branch_id"] = branch_id
+
+    invoices = await db.invoices.find(query, {"_id": 0}).to_list(50000)
+
+    product_perf = {}
+    for inv in invoices:
+        for item in inv.get("items", []):
+            pid = item.get("product_id", "")
+            if pid not in product_perf:
+                product_perf[pid] = {"name": item["name"], "qty": 0, "revenue": 0, "order_count": 0}
+            product_perf[pid]["qty"] += item["quantity"]
+            product_perf[pid]["revenue"] += item.get("total", item["price"] * item["quantity"])
+            product_perf[pid]["order_count"] += 1
+
+    # Get cost prices
+    for pid in product_perf:
+        prod = await db.products.find_one({"id": pid, "tenant_id": tid}, {"_id": 0, "cost_price": 1, "stock": 1, "category": 1})
+        if prod:
+            product_perf[pid]["cost_price"] = prod.get("cost_price", 0)
+            product_perf[pid]["stock"] = prod.get("stock", 0)
+            product_perf[pid]["category"] = prod.get("category", "")
+
+    scored = []
+    for pid, data in product_perf.items():
+        profit = data["revenue"] - data.get("cost_price", 0) * data["qty"]
+        velocity = data["qty"] / days
+        margin = (profit / data["revenue"] * 100) if data["revenue"] > 0 else 0
+        # Performance score (0-100)
+        score = min(100, int(velocity * 20 + margin * 0.5 + data["order_count"] * 0.5))
+        scored.append({
+            "product_id": pid, "name": data["name"], "category": data.get("category", ""),
+            "qty_sold": data["qty"], "revenue": round(data["revenue"], 2),
+            "profit": round(profit, 2), "margin_pct": round(margin, 1),
+            "velocity_per_day": round(velocity, 2), "order_count": data["order_count"],
+            "stock": data.get("stock", 0), "performance_score": score,
+        })
+
+    scored.sort(key=lambda x: x["performance_score"], reverse=True)
+
+    # Slow movers
+    all_products = await db.products.find({"tenant_id": tid, "stock": {"$gt": 0}}, {"_id": 0, "id": 1, "name": 1, "stock": 1, "price": 1, "category": 1}).to_list(10000)
+    sold_ids = set(product_perf.keys())
+    slow_movers = [{"product_id": p["id"], "name": p["name"], "stock": p["stock"], "value": round(p["stock"] * p.get("price", 0), 2), "category": p.get("category", "")}
+                   for p in all_products if p["id"] not in sold_ids]
+    slow_movers.sort(key=lambda x: x["value"], reverse=True)
+
+    return {
+        "top_performers": scored[:20],
+        "bottom_performers": list(reversed(scored[-10:])) if len(scored) > 10 else [],
+        "slow_movers": slow_movers[:20],
+        "total_products_sold": len(scored),
+        "total_slow_movers": len(slow_movers),
+    }
+
+# ═══════════════════════════════════════════════════════════════════
 #  APP SETUP
 # ═══════════════════════════════════════════════════════════════════
 
@@ -5232,6 +6211,16 @@ async def startup():
     await db.api_analytics.create_index("timestamp", expireAfterSeconds=90 * 86400)  # Auto-delete after 90 days
     await db.advance_orders.create_index([("tenant_id", 1), ("status", 1)])
     await db.advance_orders.create_index([("tenant_id", 1), ("created_at", -1)])
+
+    # Branch & Category indexes
+    await db.branches.create_index([("tenant_id", 1), ("code", 1)], unique=True, sparse=True)
+    await db.branches.create_index([("tenant_id", 1), ("is_active", 1)])
+    await db.categories.create_index([("tenant_id", 1), ("parent_id", 1)])
+    await db.categories.create_index([("tenant_id", 1), ("level", 1)])
+    await db.products.create_index([("tenant_id", 1), ("branch_id", 1)])
+    await db.products.create_index([("tenant_id", 1), ("category_id", 1)])
+    await db.products.create_index([("tenant_id", 1), ("expiry_date", 1)])
+    await db.invoices.create_index([("tenant_id", 1), ("branch_id", 1), ("created_at", -1)])
 
     # Seed admin user
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@retailsaas.com")

@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 class RetailSaaSAPITester:
-    def __init__(self, base_url: str = "https://point-of-sale-57.preview.emergentagent.com"):
+    def __init__(self, base_url: str = "http://localhost:8001"):
         self.base_url = base_url.rstrip('/')
         self.api_url = f"{self.base_url}/api"
         self.session = requests.Session()
@@ -1988,6 +1988,159 @@ class RetailSaaSAPITester:
             print("\n✅ ALL TESTS PASSED!")
         
         return success
+    def test_phase_1_3_features(self):
+        """Test Phase 1-3 specific features as requested"""
+        print("🚀 Testing Phase 1-3 Features...")
+        
+        # Test 1: Login with admin@retailsaas.com / Admin@123
+        success = self.test_admin_login()
+        if not success:
+            self.log_test("Phase 1-3 Login", False, "Admin login failed", critical=True)
+            return False
+        
+        # Test 2: GET /api/branches should return branches list
+        success, data = self.make_request('GET', '/branches')
+        if success and 'branches' in data:
+            self.log_test("GET /api/branches", True, f"Found {len(data['branches'])} branches")
+        else:
+            self.log_test("GET /api/branches", False, f"Failed: {data}")
+        
+        # Test 3: POST /api/branches should create a new branch (Premium feature)
+        branch_data = {
+            "name": "Test Branch",
+            "code": "TB001",
+            "address": "123 Test Street",
+            "phone": "9876543210",
+            "manager_name": "Test Manager"
+        }
+        success, data = self.make_request('POST', '/branches', branch_data, 200)
+        if success and 'id' in data:
+            self.test_branch_id = data['id']
+            self.log_test("POST /api/branches", True, f"Created branch: {data['name']} (ID: {data['id']})")
+        else:
+            self.log_test("POST /api/branches", False, f"Failed: {data}")
+        
+        # Test 4: GET /api/categories should return categories
+        success, data = self.make_request('GET', '/categories')
+        if success and 'categories' in data:
+            self.log_test("GET /api/categories", True, f"Found {len(data['categories'])} categories")
+        else:
+            self.log_test("GET /api/categories", False, f"Failed: {data}")
+        
+        # Test 5: GET /api/categories?flat=true should return flat categories
+        success, data = self.make_request('GET', '/categories?flat=true')
+        if success and 'categories' in data:
+            self.log_test("GET /api/categories?flat=true", True, f"Found {len(data['categories'])} flat categories")
+        else:
+            self.log_test("GET /api/categories?flat=true", False, f"Failed: {data}")
+        
+        # Test 6: POST /api/categories should create category with optional parent_id
+        category_data = {
+            "name": "Test Category",
+            "description": "Test category for API testing",
+            "icon": "📦",
+            "sort_order": 1
+        }
+        success, data = self.make_request('POST', '/categories', category_data, 200)
+        if success and 'id' in data:
+            self.test_category_id = data['id']
+            self.log_test("POST /api/categories", True, f"Created category: {data['name']} (ID: {data['id']})")
+            
+            # Test creating subcategory with parent_id
+            subcategory_data = {
+                "name": "Test Subcategory",
+                "parent_id": self.test_category_id,
+                "description": "Test subcategory"
+            }
+            success, data = self.make_request('POST', '/categories', subcategory_data, 200)
+            if success and 'id' in data:
+                self.log_test("POST /api/categories (with parent_id)", True, f"Created subcategory: {data['name']}")
+            else:
+                self.log_test("POST /api/categories (with parent_id)", False, f"Failed: {data}")
+        else:
+            self.log_test("POST /api/categories", False, f"Failed: {data}")
+        
+        # Test 7: GET /api/inventory/bulk-template?format=csv should return CSV template
+        success, data = self.make_request('GET', '/inventory/bulk-template?format=csv')
+        if success:
+            self.log_test("GET /api/inventory/bulk-template?format=csv", True, "CSV template generated")
+        else:
+            self.log_test("GET /api/inventory/bulk-template?format=csv", False, f"Failed: {data}")
+        
+        # Test 8: GET /api/reports/profit-dashboard?period=30d should return profit analytics
+        success, data = self.make_request('GET', '/reports/profit-dashboard?period=30d')
+        if success and ('summary' in data or 'profit_data' in data or 'total_profit' in data or 'profit_margin' in data):
+            self.log_test("GET /api/reports/profit-dashboard?period=30d", True, "Profit analytics returned")
+        else:
+            self.log_test("GET /api/reports/profit-dashboard?period=30d", False, f"Failed: {data}")
+        
+        # Test 9: GET /api/inventory/expiry-dashboard should return expiry data
+        success, data = self.make_request('GET', '/inventory/expiry-dashboard')
+        if success and ('summary' in data or 'expiring_products' in data or 'expired_products' in data or 'expiry_alerts' in data):
+            self.log_test("GET /api/inventory/expiry-dashboard", True, "Expiry dashboard data returned")
+        else:
+            self.log_test("GET /api/inventory/expiry-dashboard", False, f"Failed: {data}")
+        
+        # Test 10: GET /api/analytics/sales-trends?period=30d should return hourly/daily/weekday data
+        success, data = self.make_request('GET', '/analytics/sales-trends?period=30d')
+        if success and ('hourly' in data or 'daily' in data or 'weekday' in data or 'trends' in data):
+            self.log_test("GET /api/analytics/sales-trends?period=30d", True, "Sales trends data returned")
+        else:
+            self.log_test("GET /api/analytics/sales-trends?period=30d", False, f"Failed: {data}")
+        
+        # Test 11: GET /api/analytics/customer-rfm should return RFM segments
+        success, data = self.make_request('GET', '/analytics/customer-rfm')
+        if success and ('rfm_segments' in data or 'customers' in data or 'segments' in data):
+            self.log_test("GET /api/analytics/customer-rfm", True, "Customer RFM data returned")
+        else:
+            self.log_test("GET /api/analytics/customer-rfm", False, f"Failed: {data}")
+        
+        # Test 12: GET /api/analytics/product-performance should return performance data
+        success, data = self.make_request('GET', '/analytics/product-performance')
+        if success and ('top_performers' in data or 'products' in data or 'performance_data' in data or 'top_products' in data):
+            self.log_test("GET /api/analytics/product-performance", True, "Product performance data returned")
+        else:
+            self.log_test("GET /api/analytics/product-performance", False, f"Failed: {data}")
+        
+        # Test 13: GET /api/access-requests should work without 500 error (bug fix)
+        success, data = self.make_request('GET', '/access-requests')
+        if success and 'requests' in data:
+            self.log_test("GET /api/access-requests (bug fix)", True, f"Access requests returned: {len(data['requests'])} requests")
+        else:
+            # Check if it's a 500 error specifically
+            if isinstance(data, dict) and data.get('status_code') == 500:
+                self.log_test("GET /api/access-requests (bug fix)", False, f"500 error still present: {data}", critical=True)
+            else:
+                self.log_test("GET /api/access-requests (bug fix)", False, f"Failed: {data}")
+        
+        return True
+
+    def run_phase_1_3_tests(self):
+        """Run Phase 1-3 specific tests"""
+        print("🚀 Testing RetailPro SaaS Phase 1-3 Features")
+        print("=" * 60)
+        
+        # Test Phase 1-3 features
+        self.test_phase_1_3_features()
+
+        # Print final results
+        print("\n" + "=" * 60)
+        print(f"📊 PHASE 1-3 TEST RESULTS")
+        print(f"Tests Run: {self.tests_run}")
+        print(f"Tests Passed: {self.tests_passed}")
+        print(f"Success Rate: {(self.tests_passed/self.tests_run*100):.1f}%")
+        
+        if self.failed_tests:
+            print(f"\n❌ Failed Tests ({len(self.failed_tests)}):")
+            for test in self.failed_tests:
+                print(f"  • {test['name']}: {test['details']}")
+        
+        if self.critical_failures:
+            print(f"\n🚨 Critical Failures ({len(self.critical_failures)}):")
+            for test in self.critical_failures:
+                print(f"  • {test['name']}: {test['details']}")
+        
+        return len(self.critical_failures) == 0 and self.tests_passed >= self.tests_run * 0.8
 
 def main():
     """Main test execution"""
@@ -2004,6 +2157,9 @@ def main():
         elif sys.argv[1] == "--analytics-access-control":
             tester = RetailSaaSAPITester()
             success = tester.run_analytics_access_control_test()
+        elif sys.argv[1] == "--phase-1-3":
+            tester = RetailSaaSAPITester()
+            success = tester.run_phase_1_3_tests()
         else:
             tester = RetailSaaSAPITester()
             success = tester.run_all_tests()
