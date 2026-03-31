@@ -36,6 +36,8 @@ import BarcodePrintPage from '@/pages/BarcodePrintPage';
 import ProfitDashboardPage from '@/pages/ProfitDashboardPage';
 import ExpiryDashboardPage from '@/pages/ExpiryDashboardPage';
 import SalesTrendsPage from '@/pages/SalesTrendsPage';
+import TransferRequestsPage from '@/pages/TransferRequestsPage';
+import SupermarketSearchPage from '@/pages/SupermarketSearchPage';
 import '@/App.css';
 
 function ProtectedRoute({ children, roles, adminAccess }) {
@@ -99,6 +101,8 @@ function AppRoutes() {
       <Route path="/profit-dashboard" element={<ProtectedRoute roles={['OWNER', 'MANAGER']}><ProfitDashboardPage /></ProtectedRoute>} />
       <Route path="/expiry-dashboard" element={<ProtectedRoute><ExpiryDashboardPage /></ProtectedRoute>} />
       <Route path="/sales-trends" element={<ProtectedRoute roles={['OWNER', 'MANAGER']}><SalesTrendsPage /></ProtectedRoute>} />
+      <Route path="/transfer-requests" element={<ProtectedRoute><TransferRequestsPage /></ProtectedRoute>} />
+      <Route path="/product-search" element={<ProtectedRoute><SupermarketSearchPage /></ProtectedRoute>} />
       <Route path="/receipt/:shareToken" element={<PublicReceiptPage />} />
       <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="/dashboard" replace />} />

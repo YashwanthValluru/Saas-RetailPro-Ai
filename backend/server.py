@@ -1156,20 +1156,28 @@ async def admin_reset_mfa(user_id: str, request: Request):
 # ═══════════════════════════════════════════════════════════════════
 
 @api_router.get("/inventory/products")
-async def list_products(request: Request, search: str = "", category: str = "", page: int = 1, limit: int = 50):
+async def list_products(request: Request, search: str = "", category: str = "", page: int = 1, limit: int = 50, branch_id: str = ""):
     user = await get_current_user(request)
     if not get_user_permission(user, "can_manage_inventory"):
         await alert_unauthorized_access(user, "inventory_products", request)
         raise HTTPException(403, "You don't have permission to access inventory. Contact your store owner.")
 
+    # Staff can only see their assigned branch
+    user_branch = user.get("branch_id", "")
+    effective_branch = branch_id
+    if user["role"] == "STAFF" and user_branch:
+        effective_branch = user_branch
+
     # Check cache for non-search requests
-    cache_key = f"products:{search}:{category}:{page}:{limit}"
+    cache_key = f"products:{search}:{category}:{page}:{limit}:{effective_branch}"
     if not search:  # Only cache non-search requests (full lists)
         cached = product_cache.get(user["tenant_id"], cache_key)
         if cached is not None:
             return cached
 
     query = {"tenant_id": user["tenant_id"]}
+    if effective_branch:
+        query["branch_id"] = effective_branch
     if search:
         query["$or"] = [
             {"name": {"$regex": search, "$options": "i"}},
@@ -1495,14 +1503,18 @@ async def list_users(request: Request):
     user = await get_current_user(request)
     if user["role"] == "STAFF":
         raise HTTPException(403, "Insufficient permissions")
-    users = await db.users.find({"tenant_id": user["tenant_id"]}, {"password_hash": 0, "mfa_secret": 0}).to_list(100)
+    users = await db.users.find({"tenant_id": user["tenant_id"]}, {"password_hash": 0, "mfa_secret": 0}).to_list(500)
+    # Get branches for enrichment
+    branches = await db.branches.find({"tenant_id": user["tenant_id"]}, {"_id": 0, "id": 1, "name": 1}).to_list(100)
+    bmap = {b["id"]: b["name"] for b in branches}
     for u in users:
         if "_id" in u:
             u["id"] = str(u.pop("_id"))
         # Ensure permissions are included
         if "permissions" not in u:
             u["permissions"] = {"can_view_revenue": u.get("role") == "OWNER", "can_manage_inventory": True}
-    return {"users": users}
+        u["branch_name"] = bmap.get(u.get("branch_id", ""), "All Branches")
+    return {"users": users, "branches": branches}
 
 @api_router.post("/users")
 async def create_user(req: UserCreate, request: Request):
@@ -1530,7 +1542,7 @@ async def create_user(req: UserCreate, request: Request):
     user_doc = {
         "email": email, "password_hash": hash_password(req.password), "name": req.name,
         "role": req.role, "tenant_id": admin["tenant_id"], "is_active": True,
-        "mfa_enabled": False, "mfa_secret": None,
+        "mfa_enabled": False, "mfa_secret": None, "branch_id": "",
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     result = await db.users.insert_one(user_doc)
@@ -6024,6 +6036,354 @@ async def product_performance(request: Request, period: str = "30d", branch_id: 
     }
 
 # ═══════════════════════════════════════════════════════════════════
+#  SUPERMARKET-SCALE: CROSS-BRANCH AVAILABILITY & TRANSFER REQUESTS
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.get("/inventory/cross-branch/{product_id}")
+async def cross_branch_availability(product_id: str, request: Request):
+    """Check product availability across all branches"""
+    user = await get_current_user(request)
+    tid = user["tenant_id"]
+
+    # Find the product in any branch
+    products = await db.products.find(
+        {"tenant_id": tid, "$or": [{"id": product_id}, {"sku": product_id}, {"barcode": product_id}]},
+        {"_id": 0}
+    ).to_list(100)
+
+    if not products:
+        # Search by name (partial match for the same product across branches)
+        sample = await db.products.find_one({"id": product_id, "tenant_id": tid}, {"_id": 0, "name": 1, "sku": 1})
+        if sample:
+            products = await db.products.find(
+                {"tenant_id": tid, "name": sample["name"]}, {"_id": 0}
+            ).to_list(100)
+
+    # Group by branch
+    branches = await db.branches.find({"tenant_id": tid}, {"_id": 0}).to_list(100)
+    branch_map = {b["id"]: b for b in branches}
+    branch_map[""] = {"name": "Unassigned", "id": "", "address": ""}
+
+    availability = []
+    for p in products:
+        bid = p.get("branch_id", "")
+        branch = branch_map.get(bid, {"name": "Unknown", "id": bid})
+        availability.append({
+            "product_id": p["id"], "name": p.get("name", ""),
+            "branch_id": bid, "branch_name": branch.get("name", ""),
+            "branch_address": branch.get("address", ""),
+            "stock": p.get("stock", 0), "price": p.get("price", 0),
+            "sku": p.get("sku", ""), "barcode": p.get("barcode", ""),
+        })
+
+    availability.sort(key=lambda x: x["stock"], reverse=True)
+    total_stock = sum(a["stock"] for a in availability)
+
+    return {
+        "product_name": products[0]["name"] if products else "",
+        "total_stock_all_branches": total_stock,
+        "branches": availability,
+        "branch_count": len(availability),
+    }
+
+@api_router.post("/transfer-requests")
+async def create_transfer_request(request: Request):
+    """Staff/Manager creates a transfer request from another branch"""
+    user = await get_current_user(request)
+    body = await request.json()
+    product_id = body.get("product_id", "")
+    source_branch_id = body.get("source_branch_id", "")
+    target_branch_id = body.get("target_branch_id", "")
+    quantity = int(body.get("quantity", 1))
+    reason = body.get("reason", "")
+
+    if not product_id or not source_branch_id or not target_branch_id:
+        raise HTTPException(400, "product_id, source_branch_id, and target_branch_id required")
+    if source_branch_id == target_branch_id:
+        raise HTTPException(400, "Source and target branch cannot be the same")
+    if quantity < 1:
+        raise HTTPException(400, "Quantity must be at least 1")
+
+    # Verify product exists in source branch
+    product = await db.products.find_one(
+        {"id": product_id, "tenant_id": user["tenant_id"], "branch_id": source_branch_id}, {"_id": 0}
+    )
+    if not product:
+        raise HTTPException(404, "Product not found in source branch")
+    if product.get("stock", 0) < quantity:
+        raise HTTPException(400, f"Insufficient stock. Available: {product.get('stock', 0)}")
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "tenant_id": user["tenant_id"],
+        "product_id": product_id,
+        "product_name": product.get("name", ""),
+        "source_branch_id": source_branch_id,
+        "target_branch_id": target_branch_id,
+        "quantity": quantity,
+        "reason": reason,
+        "status": "pending",
+        "requested_by": user["id"],
+        "requested_by_name": user.get("name", ""),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.transfer_requests.insert_one(doc)
+    await log_audit(user["tenant_id"], user["id"], "transfer_request_created",
+                    f"Transfer {quantity}x {product.get('name','')} from branch {source_branch_id} to {target_branch_id}",
+                    request.client.host if request.client else "")
+    doc.pop("_id", None)
+    return doc
+
+@api_router.get("/transfer-requests")
+async def list_transfer_requests(request: Request, status: str = "", page: int = 1, limit: int = 20):
+    user = await get_current_user(request)
+    query = {"tenant_id": user["tenant_id"]}
+    user_branch = user.get("branch_id", "")
+    # Staff see only requests involving their branch
+    if user["role"] == "STAFF" and user_branch:
+        query["$or"] = [{"source_branch_id": user_branch}, {"target_branch_id": user_branch}]
+    if status:
+        query["status"] = status
+
+    total = await db.transfer_requests.count_documents(query)
+    skip = (page - 1) * limit
+    requests_list = await db.transfer_requests.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+
+    # Enrich with branch names
+    branches = await db.branches.find({"tenant_id": user["tenant_id"]}, {"_id": 0, "id": 1, "name": 1}).to_list(100)
+    bmap = {b["id"]: b["name"] for b in branches}
+    for r in requests_list:
+        r["source_branch_name"] = bmap.get(r.get("source_branch_id", ""), "Unknown")
+        r["target_branch_name"] = bmap.get(r.get("target_branch_id", ""), "Unknown")
+
+    return {"requests": requests_list, "total": total, "page": page, "pages": (total + limit - 1) // limit}
+
+@api_router.put("/transfer-requests/{request_id}")
+async def handle_transfer_request(request_id: str, request: Request):
+    """OWNER/MANAGER approves or rejects a transfer request"""
+    user = await get_current_user(request)
+    if user["role"] == "STAFF":
+        raise HTTPException(403, "Staff cannot approve transfer requests")
+    body = await request.json()
+    action = body.get("action", "")  # approve / reject
+
+    tr = await db.transfer_requests.find_one({"id": request_id, "tenant_id": user["tenant_id"]})
+    if not tr:
+        raise HTTPException(404, "Transfer request not found")
+    if tr["status"] != "pending":
+        raise HTTPException(400, f"Request is already {tr['status']}")
+
+    if action == "approve":
+        # Deduct from source, add to target
+        source_product = await db.products.find_one(
+            {"id": tr["product_id"], "tenant_id": user["tenant_id"], "branch_id": tr["source_branch_id"]}
+        )
+        if not source_product or source_product.get("stock", 0) < tr["quantity"]:
+            raise HTTPException(400, "Insufficient stock in source branch")
+
+        # Deduct from source
+        await db.products.update_one(
+            {"id": tr["product_id"], "tenant_id": user["tenant_id"], "branch_id": tr["source_branch_id"]},
+            {"$inc": {"stock": -tr["quantity"]}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+
+        # Find or create in target branch
+        target_product = await db.products.find_one(
+            {"tenant_id": user["tenant_id"], "branch_id": tr["target_branch_id"],
+             "$or": [{"id": tr["product_id"]}, {"sku": source_product.get("sku", "")}, {"name": source_product.get("name", "")}]}
+        )
+
+        if target_product:
+            await db.products.update_one(
+                {"_id": target_product["_id"]},
+                {"$inc": {"stock": tr["quantity"]}, "$set": {"updated_at": datetime.now(timezone.utc).isoformat()}}
+            )
+        else:
+            # Clone product to target branch
+            new_product = {k: v for k, v in source_product.items() if k != "_id"}
+            new_product["id"] = str(uuid.uuid4())
+            new_product["branch_id"] = tr["target_branch_id"]
+            new_product["stock"] = tr["quantity"]
+            new_product["created_at"] = datetime.now(timezone.utc).isoformat()
+            await db.products.insert_one(new_product)
+
+        await db.transfer_requests.update_one(
+            {"id": request_id},
+            {"$set": {"status": "approved", "approved_by": user["id"], "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        product_cache.invalidate(user["tenant_id"])
+        await log_audit(user["tenant_id"], user["id"], "transfer_approved",
+                        f"Approved transfer of {tr['quantity']}x {tr.get('product_name','')}",
+                        request.client.host if request.client else "")
+        return {"message": "Transfer approved and stock updated"}
+
+    elif action == "reject":
+        await db.transfer_requests.update_one(
+            {"id": request_id},
+            {"$set": {"status": "rejected", "rejected_by": user["id"], "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        await log_audit(user["tenant_id"], user["id"], "transfer_rejected",
+                        f"Rejected transfer of {tr['quantity']}x {tr.get('product_name','')}",
+                        request.client.host if request.client else "")
+        return {"message": "Transfer rejected"}
+    else:
+        raise HTTPException(400, "Action must be 'approve' or 'reject'")
+
+# ═══════════════════════════════════════════════════════════════════
+#  SUPERMARKET-SCALE: STAFF BRANCH ASSIGNMENT
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.put("/users/{user_id}/assign-branch")
+async def assign_user_branch(user_id: str, request: Request):
+    """OWNER assigns a staff/manager to a specific branch"""
+    admin = await get_current_user(request)
+    if admin["role"] != "OWNER":
+        raise HTTPException(403, "Only OWNER can assign branches")
+
+    body = await request.json()
+    branch_id = body.get("branch_id", "")
+
+    if branch_id:
+        branch = await db.branches.find_one({"id": branch_id, "tenant_id": admin["tenant_id"]})
+        if not branch:
+            raise HTTPException(404, "Branch not found")
+
+    target = await db.users.find_one({"_id": ObjectId(user_id), "tenant_id": admin["tenant_id"]})
+    if not target:
+        raise HTTPException(404, "User not found")
+
+    await db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"branch_id": branch_id, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+
+    branch_name = branch.get("name", "None") if branch_id else "All Branches"
+    await log_audit(admin["tenant_id"], admin["id"], "user_branch_assigned",
+                    f"User {target.get('email','')} assigned to branch: {branch_name}",
+                    request.client.host if request.client else "", "security")
+    return {"message": f"User assigned to {branch_name}", "branch_id": branch_id}
+
+@api_router.get("/users/{user_id}/branch")
+async def get_user_branch(user_id: str, request: Request):
+    admin = await get_current_user(request)
+    target = await db.users.find_one({"_id": ObjectId(user_id), "tenant_id": admin["tenant_id"]}, {"_id": 0, "branch_id": 1, "name": 1, "email": 1})
+    if not target:
+        raise HTTPException(404, "User not found")
+    branch = None
+    if target.get("branch_id"):
+        branch = await db.branches.find_one({"id": target["branch_id"], "tenant_id": admin["tenant_id"]}, {"_id": 0, "name": 1, "code": 1})
+    return {"user_id": user_id, "branch_id": target.get("branch_id", ""), "branch": branch}
+
+# ═══════════════════════════════════════════════════════════════════
+#  SUPERMARKET-SCALE: SMART SEARCH WITH CATEGORY SUGGESTIONS
+# ═══════════════════════════════════════════════════════════════════
+
+@api_router.get("/search/products")
+async def smart_product_search(request: Request, q: str = "", category_id: str = "", branch_id: str = "",
+                                page: int = 1, limit: int = 50, sort_by: str = "name", sort_dir: str = "asc"):
+    """High-performance product search with category filtering, branch filtering, and pagination"""
+    user = await get_current_user(request)
+    tid = user["tenant_id"]
+
+    query = {"tenant_id": tid}
+    # Branch filtering: Staff see only their branch, others can filter
+    user_branch = user.get("branch_id", "")
+    if user["role"] == "STAFF" and user_branch:
+        query["branch_id"] = user_branch
+    elif branch_id:
+        query["branch_id"] = branch_id
+
+    if category_id:
+        # Include subcategories
+        subcats = await db.categories.find({"tenant_id": tid, "path": category_id}, {"_id": 0, "id": 1}).to_list(500)
+        cat_ids = [category_id] + [c["id"] for c in subcats]
+        query["category_id"] = {"$in": cat_ids}
+
+    if q:
+        query["$or"] = [
+            {"name": {"$regex": q, "$options": "i"}},
+            {"sku": {"$regex": q, "$options": "i"}},
+            {"barcode": {"$regex": q, "$options": "i"}},
+            {"description": {"$regex": q, "$options": "i"}},
+            {"category": {"$regex": q, "$options": "i"}},
+        ]
+
+    sort_field = sort_by if sort_by in ("name", "price", "stock", "created_at", "category") else "name"
+    sort_order = 1 if sort_dir == "asc" else -1
+
+    total = await db.products.count_documents(query)
+    skip = (page - 1) * limit
+    products = await db.products.find(query, {"_id": 0}).sort(sort_field, sort_order).skip(skip).limit(limit).to_list(limit)
+
+    # Enrich with branch names
+    if products:
+        branch_ids = list(set(p.get("branch_id", "") for p in products if p.get("branch_id")))
+        if branch_ids:
+            branches = await db.branches.find({"tenant_id": tid, "id": {"$in": branch_ids}}, {"_id": 0, "id": 1, "name": 1}).to_list(100)
+            bmap = {b["id"]: b["name"] for b in branches}
+            for p in products:
+                p["branch_name"] = bmap.get(p.get("branch_id", ""), "")
+
+    return {
+        "products": products, "total": total, "page": page,
+        "pages": (total + limit - 1) // limit, "query": q
+    }
+
+@api_router.get("/search/suggestions")
+async def search_suggestions(request: Request, q: str = ""):
+    """Auto-suggest categories and products as user types"""
+    user = await get_current_user(request)
+    if not q or len(q) < 2:
+        return {"categories": [], "products": []}
+
+    tid = user["tenant_id"]
+
+    # Category suggestions
+    cats = await db.categories.find(
+        {"tenant_id": tid, "name": {"$regex": q, "$options": "i"}},
+        {"_id": 0, "id": 1, "name": 1, "level": 1, "parent_id": 1}
+    ).limit(5).to_list(5)
+
+    # Also match the flat category field
+    flat_cats = await db.products.distinct("category", {"tenant_id": tid, "category": {"$regex": q, "$options": "i"}})
+    for fc in flat_cats[:5]:
+        if fc and not any(c["name"] == fc for c in cats):
+            cats.append({"id": "", "name": fc, "level": 0, "type": "flat"})
+
+    # Product suggestions
+    products = await db.products.find(
+        {"tenant_id": tid, "$or": [
+            {"name": {"$regex": q, "$options": "i"}},
+            {"sku": {"$regex": q, "$options": "i"}},
+            {"barcode": q}
+        ]},
+        {"_id": 0, "id": 1, "name": 1, "sku": 1, "price": 1, "stock": 1, "category": 1, "branch_id": 1}
+    ).limit(8).to_list(8)
+
+    return {"categories": cats[:5], "products": products[:8]}
+
+@api_router.get("/categories/breadcrumb/{category_id}")
+async def category_breadcrumb(category_id: str, request: Request):
+    """Get breadcrumb trail for a category"""
+    user = await get_current_user(request)
+    cat = await db.categories.find_one({"id": category_id, "tenant_id": user["tenant_id"]}, {"_id": 0})
+    if not cat:
+        raise HTTPException(404, "Category not found")
+
+    breadcrumb = []
+    path_ids = cat.get("path", []) + [category_id]
+    if path_ids:
+        ancestors = await db.categories.find(
+            {"tenant_id": user["tenant_id"], "id": {"$in": path_ids}},
+            {"_id": 0, "id": 1, "name": 1, "level": 1}
+        ).to_list(20)
+        # Order by level
+        ancestors.sort(key=lambda x: x.get("level", 0))
+        breadcrumb = ancestors
+
+    return {"breadcrumb": breadcrumb, "current": {"id": cat["id"], "name": cat["name"]}}
+
+# ═══════════════════════════════════════════════════════════════════
 #  APP SETUP
 # ═══════════════════════════════════════════════════════════════════
 
@@ -6221,6 +6581,20 @@ async def startup():
     await db.products.create_index([("tenant_id", 1), ("category_id", 1)])
     await db.products.create_index([("tenant_id", 1), ("expiry_date", 1)])
     await db.invoices.create_index([("tenant_id", 1), ("branch_id", 1), ("created_at", -1)])
+
+    # Transfer requests indexes
+    await db.transfer_requests.create_index([("tenant_id", 1), ("status", 1)])
+    await db.transfer_requests.create_index([("tenant_id", 1), ("created_at", -1)])
+    await db.transfer_requests.create_index([("tenant_id", 1), ("source_branch_id", 1)])
+    await db.transfer_requests.create_index([("tenant_id", 1), ("target_branch_id", 1)])
+
+    # Performance: compound indexes for large-scale search
+    await db.products.create_index([("tenant_id", 1), ("name", 1)])
+    await db.products.create_index([("tenant_id", 1), ("branch_id", 1), ("stock", 1)])
+    await db.products.create_index([("tenant_id", 1), ("branch_id", 1), ("category_id", 1)])
+
+    # User branch assignment
+    await db.users.create_index([("tenant_id", 1), ("branch_id", 1)])
 
     # Seed admin user
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@retailsaas.com")

@@ -37,6 +37,9 @@ class RetailSaaSAPITester:
         self.test_ticket_id = None
         self.test_access_request_id = None
         self.test_temp_access_id = None
+        self.test_category_id = None
+        self.test_branch_id = None
+        self.test_transfer_request_id = None
 
     def log_test(self, name: str, success: bool, details: str = "", critical: bool = False):
         """Log test results"""
@@ -1855,6 +1858,238 @@ class RetailSaaSAPITester:
 
         return True
 
+    def test_supermarket_search_features(self):
+        """Test supermarket-scale search features"""
+        print("🔍 Testing Supermarket Search Features...")
+        
+        # Test 1: Product search with pagination
+        success, data = self.make_request('GET', '/search/products?q=test&page=1&limit=10')
+        if success and 'products' in data:
+            self.log_test("Product Search with Pagination", True, f"Found {len(data['products'])} products, total: {data.get('total', 0)}")
+        else:
+            self.log_test("Product Search with Pagination", False, f"Failed: {data}")
+
+        # Test 2: Search suggestions
+        success, data = self.make_request('GET', '/search/suggestions?q=ele')
+        if success and ('categories' in data or 'products' in data):
+            categories = data.get('categories', [])
+            products = data.get('products', [])
+            self.log_test("Search Suggestions", True, f"Found {len(categories)} category suggestions, {len(products)} product suggestions")
+        else:
+            self.log_test("Search Suggestions", False, f"Failed: {data}")
+
+        return True
+
+    def test_category_breadcrumb(self):
+        """Test category breadcrumb functionality"""
+        print("📂 Testing Category Breadcrumb...")
+        
+        # First create a category to test with
+        category_data = {
+            "name": "Test Electronics",
+            "description": "Test category for breadcrumb"
+        }
+        
+        success, data = self.make_request('POST', '/categories', category_data, 200)
+        if success and 'id' in data:
+            self.test_category_id = data['id']
+            self.log_test("Create Test Category", True, f"Created category: {data['name']} (ID: {data['id']})")
+            
+            # Test breadcrumb for this category
+            success, breadcrumb_data = self.make_request('GET', f'/categories/breadcrumb/{self.test_category_id}')
+            if success and 'breadcrumb' in breadcrumb_data:
+                breadcrumb = breadcrumb_data['breadcrumb']
+                self.log_test("Category Breadcrumb", True, f"Breadcrumb has {len(breadcrumb)} levels")
+            else:
+                self.log_test("Category Breadcrumb", False, f"Failed: {breadcrumb_data}")
+        else:
+            self.log_test("Create Test Category", False, f"Failed: {data}")
+
+        return True
+
+    def test_cross_branch_inventory(self):
+        """Test cross-branch inventory availability"""
+        print("🏢 Testing Cross-Branch Inventory...")
+        
+        # First check if we already have a branch
+        success, data = self.make_request('GET', '/branches')
+        if success and 'branches' in data and len(data['branches']) > 0:
+            self.test_branch_id = data['branches'][0]['id']
+            self.log_test("Use Existing Branch", True, f"Using existing branch: {data['branches'][0]['name']} (ID: {self.test_branch_id})")
+        else:
+            # Create a branch with unique code
+            import time
+            unique_suffix = str(int(time.time()))[-6:]
+            branch_data = {
+                "name": f"Test Branch {unique_suffix}",
+                "code": f"TB{unique_suffix}",
+                "address": "Test Address"
+            }
+            
+            success, data = self.make_request('POST', '/branches', branch_data, 200)
+            if success and 'id' in data:
+                self.test_branch_id = data['id']
+                self.log_test("Create Test Branch", True, f"Created branch: {data['name']} (ID: {data['id']})")
+            else:
+                self.log_test("Create Test Branch", False, f"Failed: {data}")
+
+        # Create a product if we don't have one
+        if not self.test_product_id:
+            self.test_create_product()
+
+        # Test cross-branch availability
+        if self.test_product_id:
+            success, data = self.make_request('GET', f'/inventory/cross-branch/{self.test_product_id}')
+            if success and 'branches' in data:
+                branches = data['branches']
+                total_stock = data.get('total_stock_all_branches', 0)
+                self.log_test("Cross-Branch Inventory", True, f"Found availability across {len(branches)} branches, total stock: {total_stock}")
+            else:
+                self.log_test("Cross-Branch Inventory", False, f"Failed: {data}")
+
+        return True
+
+    def test_transfer_requests(self):
+        """Test transfer request functionality"""
+        print("🔄 Testing Transfer Requests...")
+        
+        # Ensure we have product and branches
+        if not self.test_product_id:
+            self.test_create_product()
+        if not self.test_branch_id:
+            self.test_cross_branch_inventory()
+
+        # Get existing branches or create new ones
+        success, data = self.make_request('GET', '/branches')
+        if success and 'branches' in data and len(data['branches']) >= 2:
+            branches = data['branches']
+            source_branch_id = branches[0]['id']
+            target_branch_id = branches[1]['id']
+            self.log_test("Use Existing Branches for Transfer", True, f"Using branches: {branches[0]['name']} -> {branches[1]['name']}")
+        else:
+            # Create second branch for transfer
+            import time
+            unique_suffix = str(int(time.time()))[-6:]
+            branch_data_2 = {
+                "name": f"Test Branch 2 {unique_suffix}",
+                "code": f"TB2{unique_suffix}",
+                "address": "Test Address 2"
+            }
+            
+            success, data = self.make_request('POST', '/branches', branch_data_2, 200)
+            if success and 'id' in data:
+                target_branch_id = data['id']
+                source_branch_id = self.test_branch_id
+                self.log_test("Create Second Test Branch", True, f"Created branch: {data['name']} (ID: {data['id']})")
+            else:
+                self.log_test("Create Second Test Branch", False, f"Failed: {data}")
+                return False
+
+        # Test 1: Create transfer request
+        transfer_data = {
+            "product_id": self.test_product_id,
+            "source_branch_id": source_branch_id,
+            "target_branch_id": target_branch_id,
+            "quantity": 5,
+            "reason": "Test transfer request"
+        }
+        
+        success, data = self.make_request('POST', '/transfer-requests', transfer_data, 200)
+        if success and 'id' in data:
+            self.test_transfer_request_id = data['id']
+            self.log_test("Create Transfer Request", True, f"Created transfer request: {data['id']}")
+        else:
+            self.log_test("Create Transfer Request", False, f"Failed: {data}")
+            return False
+
+        # Test 2: List transfer requests
+        success, data = self.make_request('GET', '/transfer-requests')
+        if success and 'requests' in data:
+            requests_list = data['requests']
+            self.log_test("List Transfer Requests", True, f"Found {len(requests_list)} transfer requests")
+        else:
+            self.log_test("List Transfer Requests", False, f"Failed: {data}")
+
+        # Test 3: Approve transfer request
+        if self.test_transfer_request_id:
+            approve_data = {"action": "approve"}
+            success, data = self.make_request('PUT', f'/transfer-requests/{self.test_transfer_request_id}', approve_data, 200)
+            if success:
+                self.log_test("Approve Transfer Request", True, "Transfer request approved and stock updated")
+            else:
+                self.log_test("Approve Transfer Request", False, f"Failed: {data}")
+
+        return True
+
+    def test_user_branch_assignment(self):
+        """Test user branch assignment"""
+        print("👥 Testing User Branch Assignment...")
+        
+        # Get current user info
+        success, user_data = self.make_request('GET', '/auth/me')
+        if success and 'id' in user_data:
+            user_id = user_data['id']
+            
+            # Test branch assignment
+            if self.test_branch_id:
+                assign_data = {"branch_id": self.test_branch_id}
+                success, data = self.make_request('PUT', f'/users/{user_id}/assign-branch', assign_data, 200)
+                if success:
+                    self.log_test("Assign User to Branch", True, f"User assigned to branch {self.test_branch_id}")
+                else:
+                    self.log_test("Assign User to Branch", False, f"Failed: {data}")
+            else:
+                self.log_test("Assign User to Branch", False, "No test branch available")
+        else:
+            self.log_test("Get User Info", False, f"Failed: {user_data}")
+
+        return True
+
+    def test_branch_filtered_inventory(self):
+        """Test branch-filtered inventory"""
+        print("📦 Testing Branch-Filtered Inventory...")
+        
+        if self.test_branch_id:
+            # Test inventory filtering by branch
+            success, data = self.make_request('GET', f'/inventory/products?branch_id={self.test_branch_id}')
+            if success and 'products' in data:
+                products = data['products']
+                self.log_test("Branch-Filtered Inventory", True, f"Found {len(products)} products for branch {self.test_branch_id}")
+            else:
+                self.log_test("Branch-Filtered Inventory", False, f"Failed: {data}")
+        else:
+            self.log_test("Branch-Filtered Inventory", False, "No test branch available")
+
+        return True
+
+    def run_supermarket_tests(self):
+        """Run all supermarket-scale feature tests"""
+        print("🏪 Starting Supermarket-Scale Feature Tests")
+        print("=" * 60)
+        
+        # Login as admin first
+        if not self.test_admin_login():
+            print("❌ CRITICAL: Admin login failed. Cannot proceed with tests.")
+            return False
+
+        # Run supermarket feature tests
+        supermarket_tests = [
+            self.test_supermarket_search_features,
+            self.test_category_breadcrumb,
+            self.test_cross_branch_inventory,
+            self.test_transfer_requests,
+            self.test_user_branch_assignment,
+            self.test_branch_filtered_inventory
+        ]
+        
+        for test_method in supermarket_tests:
+            try:
+                test_method()
+            except Exception as e:
+                self.log_test(test_method.__name__, False, f"Exception: {str(e)}")
+
+        return True
+
     def run_all_tests(self):
         """Run comprehensive test suite including NEW features"""
         print("🚀 Starting RetailSaaS Backend API Tests (Including NEW Features)")
@@ -2160,12 +2395,15 @@ def main():
         elif sys.argv[1] == "--phase-1-3":
             tester = RetailSaaSAPITester()
             success = tester.run_phase_1_3_tests()
+        elif sys.argv[1] == "--supermarket":
+            tester = RetailSaaSAPITester()
+            success = tester.run_supermarket_tests()
         else:
             tester = RetailSaaSAPITester()
-            success = tester.run_all_tests()
+            success = tester.run_supermarket_tests()  # Default to supermarket tests
     else:
         tester = RetailSaaSAPITester()
-        success = tester.run_all_tests()
+        success = tester.run_supermarket_tests()  # Default to supermarket tests
     
     return 0 if success else 1
 

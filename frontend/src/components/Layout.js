@@ -8,7 +8,7 @@ import {
   ChevronLeft, ChevronRight, LogOut, Shield, ScrollText, Store, Brain, Truck,
   UserCheck, Key, Moon, Sun, TicketCheck, ShieldAlert, Building2, KeyRound,
   Tag, RefreshCw, CreditCard, Menu, Activity, Bell, FolderTree, Upload,
-  Barcode, TrendingUp, AlertTriangle, GitBranch
+  Barcode, TrendingUp, AlertTriangle, GitBranch, Search, ArrowRightLeft
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
@@ -30,6 +30,8 @@ const navItems = [
   { to: '/branches', icon: GitBranch, label: 'Branches', plans: ['premium'], roles: ['OWNER', 'MANAGER'], tenantOnly: true },
   { to: '/bulk-upload', icon: Upload, label: 'Bulk Upload', roles: ['OWNER', 'MANAGER'], tenantOnly: true },
   { to: '/barcode-print', icon: Barcode, label: 'Barcode Labels', tenantOnly: true },
+  { to: '/product-search', icon: Search, label: 'Product Search', tenantOnly: true },
+  { to: '/transfer-requests', icon: ArrowRightLeft, label: 'Transfers', tenantOnly: true },
   { to: '/promo-codes', icon: Tag, label: 'Promo Codes', plans: ['premium'], tenantOnly: true },
   { to: '/reorder', icon: RefreshCw, label: 'Auto Reorder', plans: ['premium'], roles: ['OWNER', 'MANAGER'], tenantOnly: true },
   { to: '/advance-orders', icon: CreditCard, label: 'Advance Orders', plans: ['premium'], tenantOnly: true },
