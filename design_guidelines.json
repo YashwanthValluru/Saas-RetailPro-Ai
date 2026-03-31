@@ -1,0 +1,127 @@
+{
+  "theme_details": {
+    "domain": "Retail B2B SaaS (Medical, Hardware, Wholesale)",
+    "archetype": "4 (Swiss & High-Contrast)",
+    "theme": "Light",
+    "rationale": "High-density data environments like POS systems and inventory management require extreme clarity, minimal visual noise, and authoritative structure. Swiss High-Contrast ensures data legibility, rapid scanning, and professional reliability. Avoiding soft/playful elements to maintain a serious 'control room' vibe."
+  },
+  "typography": {
+    "fonts": {
+      "heading": "Chivo",
+      "body": "IBM Plex Sans",
+      "mono": "JetBrains Mono"
+    },
+    "hierarchy": {
+      "h1": "text-3xl sm:text-4xl font-bold tracking-tight",
+      "h2": "text-2xl sm:text-3xl font-semibold tracking-tight",
+      "h3": "text-xl font-semibold",
+      "h4": "text-lg font-medium",
+      "body": "text-sm sm:text-base leading-relaxed",
+      "small": "text-xs uppercase tracking-widest font-medium"
+    },
+    "typesetting_rules": {
+      "numbers": "Always use tabular nums (tabular-nums) for prices, stock counts, and financial data.",
+      "labels": "Overlines/labels must be uppercase, tiny, and widely spaced."
+    }
+  },
+  "color_system": {
+    "background": {
+      "base": "#F8F9FA",
+      "surface": "#FFFFFF",
+      "surface_hover": "#F1F5F9"
+    },
+    "text": {
+      "primary": "#0F172A",
+      "secondary": "#475569",
+      "muted": "#94A3B8",
+      "inverse": "#FFFFFF"
+    },
+    "brand_action": {
+      "primary": "#2563EB",
+      "primary_hover": "#1D4ED8",
+      "secondary": "#E2E8F0",
+      "secondary_hover": "#CBD5E1",
+      "secondary_text": "#0F172A"
+    },
+    "status": {
+      "success": "#16A34A",
+      "success_bg": "#DCFCE7",
+      "warning": "#D97706",
+      "warning_bg": "#FEF3C7",
+      "danger": "#DC2626",
+      "danger_bg": "#FEE2E2",
+      "info": "#0284C7",
+      "info_bg": "#E0F2FE"
+    },
+    "borders": {
+      "default": "#E5E7EB",
+      "strong": "#D1D5DB"
+    },
+    "contrast_rules": "All text must pass WCAG AA (4.5:1). Never use gray-on-gray for essential numbers. Use pure red/green/amber for status indicators, never tinted pastels."
+  },
+  "layout_spacing": {
+    "grid_system": {
+      "type": "Control Room Grid",
+      "gaps": "gap-4 sm:gap-6",
+      "columns": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4"
+    },
+    "spacing_scale": {
+      "card_padding": "p-4 sm:p-6",
+      "section_spacing": "py-8 sm:py-12"
+    },
+    "geometry": {
+      "border_radius": "rounded-md",
+      "shadows": "shadow-sm",
+      "borders": "border border-slate-200"
+    },
+    "specific_layouts": {
+      "pos_billing": "Split screen layout. Left: 60-70% width for product search/grid. Right: 30-40% width for sticky cart, totals, and checkout CTA. Height must fill viewport (h-screen) to avoid main window scrolling.",
+      "dashboard_overview": "Top row: 4 KPI metric cards (col-span-1 each). Middle row: 2 main charts (col-span-2 each). Bottom row: 2 tall lists (e.g., Low Stock Alerts, Recent Invoices).",
+      "auth_mfa": "50/50 split layout. Left: Abstract imagery. Right: Centered login/MFA card."
+    }
+  },
+  "component_rules": {
+    "cards": "Flat background (bg-white), 1px subtle border, no shadow by default. Hover adds slight shadow-md. Do not overuse cards inside cards (nested cards).",
+    "tables": "Must have sticky headers. Right-align all numeric columns (price, quantity). Use zebra striping (even:bg-slate-50) for long lists. Include pagination and search filters.",
+    "buttons": "Square or rounded-md corners. No pill shapes. Primary buttons must have high contrast text (text-white). Focus states must include focus:ring-2 focus:ring-blue-600 focus:ring-offset-2.",
+    "inputs": "Shadcn defaults but ensure strict 1px border. Background white. Include clear error states (border-red-600, text-red-600).",
+    "navigation": "Vertical left sidebar for standard SaaS navigation. Must be collapsible to maximize horizontal space for POS and tables. Active states in sidebar should use a subtle background (bg-slate-100) and bold primary text.",
+    "mfa_qr_code": "Display inside a padded box with dashed borders (border-2 border-dashed border-slate-300). Include an alternative setup key option below."
+  },
+  "motion_interactions": {
+    "hover": "Subtle background shifts (bg-white to bg-slate-50). Button background darkening.",
+    "transitions": "Fast and snappy. transition-all duration-150 ease-in-out. Do not use slow floaty animations in a POS system.",
+    "feedback": "Use Sonner for toast notifications on successful checkout, inventory update, or errors. Position: top-right."
+  },
+  "media_assets": {
+    "auth_background": {
+      "url": "https://images.pexels.com/photos/2684383/pexels-photo-2684383.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Abstract geometric blue background for the left side of the Login/MFA screen.",
+      "usage": "Use with object-cover and a slight dark/blue overlay if text is placed on top, though preferably keep text on the white form side."
+    },
+    "pos_placeholder_1": {
+      "url": "https://images.pexels.com/photos/36730429/pexels-photo-36730429.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "description": "Customer paying at checkout counter.",
+      "usage": "Use in onboarding, marketing, or empty state illustrations for the POS module."
+    },
+    "inventory_placeholder": {
+      "url": "https://images.unsplash.com/photo-1768796373360-95d80c5830fb?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NjZ8MHwxfHNlYXJjaHwyfHxtb2Rlcm4lMjB3YXJlaG91c2UlMjBpbnZlbnRvcnl8ZW58MHx8fHwxNzc0NzcwMTc1fDA&ixlib=rb-4.1.0&q=85",
+      "description": "Modern warehouse inventory racks.",
+      "usage": "Use in onboarding, reports, or empty state illustrations for the Inventory module."
+    }
+  },
+  "testing": {
+    "attributes": "All interactive elements (buttons, inputs, select, menu items) MUST have a data-testid attribute.",
+    "convention": "kebab-case, role-based. Examples: 'login-submit-button', 'pos-add-to-cart-button', 'inventory-search-input', 'mfa-verify-button'."
+  },
+  "instructions_to_main_agent": [
+    "Install specific fonts: @fontsource/chivo, @fontsource/ibm-plex-sans, @fontsource/jetbrains-mono.",
+    "Install standard icons: Use lucide-react (default) or install @phosphor-icons/react for dense dashboard data.",
+    "Build a Left Sidebar layout with a top header. The Sidebar should collapse to icons-only for POS mode.",
+    "For the POS view, disable main window scrolling. Create a flex container where the left product list scrolls independently from the right cart summary.",
+    "Use pure Shadcn components but strip excessive border-radii to maintain the 'Swiss' archetype (override rounded-xl to rounded-md).",
+    "Never use generic fallback placeholder URLs like via.placeholder.com. ONLY use the provided media_assets.",
+    "Implement Recharts for the 'Reports & Analytics' and 'AI Demand Forecasting' modules. Keep charts minimal, using the brand primary (Blue 600) and gray axes.",
+    "Ensure 'BASIC', 'STANDARD', and 'PREMIUM' tiers have distinct visual badges (e.g., Gray, Blue, Gold/Amber) in the Settings/Subscription UI."
+  ]
+}

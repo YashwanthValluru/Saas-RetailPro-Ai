@@ -1,0 +1,76 @@
+@import url('https://fonts.googleapis.com/css2?family=Chivo:wght@400;500;600;700;800&family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ─── Font Classes ─── */
+.font-heading {
+  font-family: 'Chivo', system-ui, sans-serif;
+}
+
+.font-body {
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+}
+
+/* ─── Global ─── */
+* {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  background-color: #F8F9FA;
+}
+
+.dark body, html.dark body {
+  background-color: #0F172A;
+  color: #E2E8F0;
+}
+
+/* ─── Tabular Numbers ─── */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Scrollbar (minimal for POS) ─── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* ─── Selection ─── */
+::selection {
+  background-color: #BFDBFE;
+  color: #1E3A5F;
+}
+
+/* ─── Override Shadcn rounded-xl to rounded-md (Swiss archetype) ─── */
+[class*="rounded-xl"] {
+  border-radius: 0.375rem !important;
+}
+[class*="rounded-lg"] {
+  border-radius: 0.375rem !important;
+}
+
+/* ─── Focus states ─── */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  ring: 2px;
+  ring-color: #2563EB;
+  ring-offset: 2px;
+}
