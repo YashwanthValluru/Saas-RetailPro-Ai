@@ -1,119 +1,99 @@
 # RetailPro SaaS - Product Requirements Document
 
 ## Original Problem Statement
-Production-grade, secure, multi-tenant SaaS application for retail businesses (medical shops, hardware stores, wholesalers) with inventory management, billing (POS), reporting, subscription tiers, and Microsoft Authenticator-based MFA.
+Production-grade, secure, multi-tenant SaaS application for retail businesses (medical shops, hardware stores, wholesalers, mall supermarkets, large-scale supermarkets) with inventory management, billing (POS), reporting, subscription tiers, Microsoft Authenticator-based MFA, and scalable architecture for businesses from single small shops to large supermarket chains.
 
 ## Architecture
-- **Backend**: Python FastAPI + MongoDB (motor async driver) — single server.py (5,321 lines)
-- **Frontend**: React 19 + Tailwind CSS + Shadcn/UI — 25 pages (8,728 lines)
+- **Backend**: Python FastAPI + MongoDB (motor async driver) — server.py (6,300+ lines)
+- **Frontend**: React 19 + Tailwind CSS + Shadcn/UI — 32 pages (10,000+ lines)
 - **Auth**: JWT (httpOnly cookies) + bcrypt + TOTP MFA + backup codes
 - **Payment**: Stripe (Emergent integration library)
 - **AI**: OpenAI GPT-5.2 (Emergent LLM key) — forecasting, substitution, pulse, refill predictions
-- **Database**: MongoDB with 42+ indexes, tenant-scoped isolation
+- **Database**: MongoDB with 50+ indexes, tenant-scoped + branch-scoped isolation
 
 ## User Personas
-- **OWNER**: Full access, subscription management, user/MFA management
-- **MANAGER**: Inventory, POS, reports, user creation (staff only)
+- **OWNER**: Full access, subscription management, user/MFA management, branch management
+- **MANAGER**: Inventory, POS, reports, user creation (staff only), analytics
 - **STAFF**: Basic inventory view, POS operations
 - **PLATFORM ADMIN**: Cross-tenant management, analytics, admin CRUD
 - **PRODUCT ADMIN**: Similar to platform admin but without platform admin CRUD
 
 ## Core Requirements (Static)
 1. Multi-tenant isolation via tenant_id on all collections
-2. Role-based access control (OWNER, MANAGER, STAFF, PLATFORM_ADMIN, ADMIN)
-3. TOTP MFA with Microsoft Authenticator compatibility
-4. MFA backup codes (8 single-use codes)
-5. Subscription tiers (Basic ₹999, Standard ₹2999, Premium ₹7999)
-6. Stripe hosted checkout for subscriptions
-7. Audit logging for all actions
+2. Multi-branch support via branch_id (Premium)
+3. Role-based access control (OWNER, MANAGER, STAFF, PLATFORM_ADMIN, ADMIN)
+4. TOTP MFA with Microsoft Authenticator compatibility
+5. MFA backup codes (8 single-use codes)
+6. Subscription tiers (Basic ₹999, Standard ₹2999, Premium ₹7999)
+7. Stripe hosted checkout for subscriptions
+8. Audit logging for all actions
+9. Category hierarchy support (unlimited nesting)
+10. Scalability for large datasets (thousands to millions of products)
 
-## What's Been Implemented (Comprehensive Audit - Jan 2026)
+## What's Been Implemented (Jan 2026)
 
-### Authentication & Security
-- [x] JWT auth (httpOnly cookies, access + refresh tokens)
-- [x] Registration (restricted after first tenant)
-- [x] Login with brute-force protection (5 attempts → 15-min lockout)
-- [x] TOTP MFA (QR + manual key), backup codes
-- [x] Admin MFA reset, IP whitelisting, temp access grants
-- [x] CSRF protection, security headers, rate limiting
-- [x] Idle timeout auto-logout, heartbeat
-- [x] 3 seeded accounts (Admin OWNER, Platform Admin, Product Admin)
+### Phase 1 — Bug Fix + Multi-Branch + Categories + Bulk Upload + Barcode
+- [x] Fixed access requests bug (query variable undefined)
+- [x] Multi-branch CRUD (Premium) — create, update, delete, stats
+- [x] Branch product transfer
+- [x] Category hierarchy — unlimited nesting, tree & flat views
+- [x] Bulk product upload (CSV, Excel, JSON — up to 10K products)
+- [x] Bulk upload templates (CSV, Excel, JSON download)
+- [x] Barcode label PDF generation (Code128, 3 sizes, multi-copy)
 
-### Inventory
-- [x] Product CRUD (SKU, barcode, category, GST, HSN, batch, expiry)
-- [x] Stock adjustments, low-stock alerts, expiry alerts
-- [x] Barcode lookup (local → UPCitemdb → Open Food Facts)
-- [x] Smart product recommendations, AI substitution (GPT-5.2)
+### Phase 2 — Advanced Analytics + Invoice Email
+- [x] Advanced profit margin dashboard (period comparison, category breakdown)
+- [x] Batch expiry alert system (4-tier severity)
+- [x] Invoice email sending (HTML email via tenant SMTP)
 
-### POS / Billing
-- [x] Invoice creation with GST, stock deduction, auto-numbering
-- [x] Invoice PDF generation (ReportLab A4)
-- [x] Digital receipts with share links, WhatsApp sharing
-- [x] Public receipt page, promo code validation
-- [x] Mobile barcode scanner (session-based, QR access)
+### Phase 3 — Supermarket-Scale Analytics
+- [x] Sales trends (hourly, daily, weekday patterns)
+- [x] Peak hour/day detection
+- [x] Customer RFM analysis (5-segment scoring)
+- [x] Product performance scoring (velocity, margin, score 0-100)
+- [x] Slow-mover detection
+- [x] Branch comparison analytics
+- [x] Database indexes for all new collections (8 new indexes)
 
-### Customer Management
-- [x] Customer CRUD, credit tracking, transaction history
-- [x] Customer-linked invoices, export (CSV/Excel)
+### Previously Implemented
+- [x] JWT auth, TOTP MFA, backup codes, brute-force protection
+- [x] Inventory CRUD, stock adjustments, barcode lookup
+- [x] POS billing, invoice PDF, digital receipts
+- [x] Customer management, credit tracking
+- [x] Purchase management, supplier CRUD
+- [x] AI features (forecasting, substitution, pulse, refill predictions)
+- [x] Premium features (promo codes, auto reorder, advance orders)
+- [x] Platform admin panel (tenant/admin management)
+- [x] Security (CSRF, rate limiting, IP whitelisting, audit logs)
+- [x] Data export (CSV/Excel)
+- [x] Support ticket system
 
-### Purchase Management
-- [x] Supplier CRUD, purchase orders, receiving with stock update
-- [x] Status tracking (pending/partial/received)
-
-### Reports & Analytics
-- [x] Dashboard KPIs, 7-day revenue chart
-- [x] Sales, profit margins, category analysis, purchase analytics
-- [x] Owner/Manager analytics (Overview, Revenue, Products)
-- [x] Platform Admin analytics (cross-tenant, API usage, realtime)
-- [x] AI Business Pulse (daily briefing via GPT-5.2)
-
-### Premium Features
-- [x] Promo codes, auto reorder, notification templates
-- [x] Advance payment orders, SMTP email settings
-- [x] API keys for external access
-
-### Platform Admin
-- [x] Tenant CRUD, owner creation, admin CRUD
-- [x] Financial access request system
-- [x] Cross-tenant analytics, support ticket management
-
-### Data Export
-- [x] Inventory, invoices, customers, audit logs (CSV/Excel)
-- [x] Analytics export (admin only)
-
-### Security & Compliance
-- [x] Fraud detection alerts, audit logging (immutable)
-- [x] User activity monitoring, cache stats
-
-### AI Features (GPT-5.2 via Emergent LLM)
-- [x] Demand forecasting, smart substitution
-- [x] Business pulse, refill predictions
-
-## Known Issues
-- Voice notifications are MOCKED (no Twilio)
-- SMS sending is MOCKED (WhatsApp link only)
-- Access requests endpoint has potential undefined variable bug (line 3211)
-- Registration restricted — admin-only after first tenant
+## Known Issues / Mocked
+- Voice notifications: MOCKED (no Twilio)
+- SMS sending: MOCKED (WhatsApp link only)
+- Email notifications: Requires tenant SMTP configuration
+- Stripe webhooks: Handler exists, needs prod testing
 
 ## Prioritized Backlog
 ### P0 (Critical)
-- [ ] Fix access requests bug (line 3211)
 - [ ] Twilio integration for SMS/voice
+- [ ] Real-time WebSocket sync across branches
 
 ### P1 (Important)
-- [ ] Multi-branch support (Premium tier)
-- [ ] Invoice email sending
+- [ ] ERP/Accounting/CRM API integrations
 - [ ] WhatsApp Business API integration
-- [ ] Barcode label printing
+- [ ] PWA wrapper for mobile-first use
+- [ ] Barcode label batch printing from mobile
 
 ### P2 (Nice to Have)
 - [ ] Customer loyalty/rewards program
-- [ ] Advanced batch expiry alert dashboard
-- [ ] Mobile-first PWA wrapper
+- [ ] Multi-language support
+- [ ] Data encryption at rest
+- [ ] Advanced batch expiry alert notifications
 
 ## Next Tasks
-1. Fix access requests endpoint bug
-2. Add real SMS/voice via Twilio
-3. Multi-branch support for Premium tier
-4. Invoice email/print enhancements
-5. WhatsApp Business API for automated notifications
+1. ERP/Accounting/CRM API integrations (user deferred)
+2. Twilio integration for real SMS/voice
+3. Real-time WebSocket inventory sync
+4. PWA mobile wrapper
+5. WhatsApp Business API automation
